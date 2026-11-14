@@ -203,16 +203,30 @@ cmd_update() {
             *) die "Неизвестный флаг: $1" ;;
         esac
     done
-    local url="https://raw.githubusercontent.com/$REPO/$REF/install.sh"
-    local tmp="/tmp/dfxray-update-$$.sh"
-    info "Скачиваю установщик ($REF)"
-    curl -fsSL --max-time 60 "$url" -o "$tmp" || die "Не удалось скачать $url"
+    local tmpd archive
+    tmpd="$(mktemp -d)"
+    archive="$tmpd/src.tar.gz"
+    info "Скачиваю исходники ($REPO @ $REF)"
+    local downloaded=0 candidate
+    for candidate in \
+        "https://codeload.github.com/$REPO/tar.gz/refs/heads/$REF" \
+        "https://codeload.github.com/$REPO/tar.gz/refs/tags/$REF" \
+        "https://codeload.github.com/$REPO/tar.gz/$REF"; do
+        if curl -fsSL --max-time 120 "$candidate" -o "$archive"; then
+            downloaded=1
+            break
+        fi
+    done
+    [ "$downloaded" = "1" ] || { rm -rf "$tmpd"; die "Не удалось скачать исходники ($REPO, ref=$REF)."; }
+    tar -xzf "$archive" -C "$tmpd" --strip-components=1
+    [ -f "$tmpd/install.sh" ] || { rm -rf "$tmpd"; die "В архиве нет install.sh"; }
+
     local args=(--dir "$DFX_HOME" --yes --ref "$REF")
     [ -n "$PANEL_DOMAIN" ] && args+=(--domain "$PANEL_DOMAIN")
     [ -n "$(env_value NODE_TOKEN)" ] && args+=(--with-node)
     info "Обновляю панель (данные и .env сохраняются)"
-    bash "$tmp" "${args[@]}"
-    rm -f "$tmp"
+    bash "$tmpd/install.sh" "${args[@]}"
+    rm -rf "$tmpd"
 }
 
 cmd_uninstall() {

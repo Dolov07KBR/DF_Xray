@@ -131,6 +131,7 @@ sudo /opt/dfxray/install.sh --domain panel.example.com --yes
 | `dfxray url` | адрес панели |
 | `dfxray shell` | shell внутри контейнера панели |
 | `dfxray version` | версия панели |
+| `dfxray uninstall` | удалить контейнеры и команду (данные сохраняются) |
 
 ## Обновление
 

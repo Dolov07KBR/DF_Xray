@@ -43,6 +43,8 @@ COMPOSE=()
 PANEL_URL=""
 PANEL_BIND="0.0.0.0"
 EXISTING_ENV=0
+EXISTING_URL=""
+PORT_FLAG=0
 
 # ---------------------------------------------------------------- вывод ---
 if [ -t 1 ] && [ "${NO_COLOR:-0}" != "1" ]; then
@@ -108,7 +110,7 @@ parse_args() {
         case "$1" in
             -d|--domain)      DOMAIN="${2:-}"; shift 2 ;;
             --email)          ACME_EMAIL="${2:-}"; shift 2 ;;
-            -p|--port)        PANEL_PORT="${2:-}"; shift 2 ;;
+            -p|--port)        PANEL_PORT="${2:-}"; PORT_FLAG=1; shift 2 ;;
             --dir)            INSTALL_DIR="${2:-}"; shift 2 ;;
             --ref)            REF="${2:-}"; shift 2 ;;
             --with-node)      NODE_MODE="yes"; shift ;;
@@ -262,6 +264,9 @@ detect_public_ip() {
     if command -v curl >/dev/null 2>&1; then
         for service in https://api.ipify.org https://ifconfig.me/ip https://icanhazip.com; do
             ip="$(curl -fsS --max-time 4 "$service" 2>/dev/null | tr -dc '0-9a-fA-F.:' || true)"
+            case "$ip" in
+                169.254.*|127.*|"") continue ;;
+            esac
             if [ -n "$ip" ]; then printf '%s' "$ip"; return 0; fi
         done
     fi
@@ -334,15 +339,20 @@ fetch_sources() {
 read_existing_env() {
     if [ -f "$INSTALL_DIR/.env" ]; then
         EXISTING_ENV=1
-        local existing_pass existing_url existing_user
+        local existing_pass existing_url existing_user existing_port existing_node_port
         existing_pass="$(grep -E '^DFX_ADMIN_PASSWORD=' "$INSTALL_DIR/.env" | head -1 | cut -d= -f2- || true)"
         existing_url="$(grep -E '^DFX_BASE_URL=' "$INSTALL_DIR/.env" | head -1 | cut -d= -f2- || true)"
         existing_user="$(grep -E '^DFX_ADMIN_USERNAME=' "$INSTALL_DIR/.env" | head -1 | cut -d= -f2- || true)"
+        existing_port="$(grep -E '^PANEL_PORT=' "$INSTALL_DIR/.env" | head -1 | cut -d= -f2- || true)"
+        existing_node_port="$(grep -E '^NODE_PORT=' "$INSTALL_DIR/.env" | head -1 | cut -d= -f2- || true)"
+        EXISTING_URL="$existing_url"
         if [ -n "$existing_pass" ] && [ -z "$ADMIN_PASSWORD" ]; then ADMIN_PASSWORD="$existing_pass"; fi
         if [ -z "$DOMAIN" ] && [ -n "$existing_url" ] && [[ "$existing_url" == https://* ]]; then
             DOMAIN="${existing_url#https://}"; DOMAIN="${DOMAIN%%/*}"
         fi
         if [ -n "$existing_user" ] && [ "$ADMIN_USER" = "admin" ]; then ADMIN_USER="$existing_user"; fi
+        if [ "$PORT_FLAG" = "0" ] && [ -n "$existing_port" ]; then PANEL_PORT="$existing_port"; fi
+        if [ -z "$NODE_PORT" ] && [ -n "$existing_node_port" ]; then NODE_PORT="$existing_node_port"; fi
     fi
 }
 
@@ -418,9 +428,13 @@ ask_settings() {
         PANEL_URL="https://$DOMAIN"
     else
         PANEL_BIND="0.0.0.0"
-        local ip
-        ip="$(detect_public_ip)"
-        PANEL_URL="http://${ip}:${PANEL_PORT}"
+        if [ -n "$EXISTING_URL" ] && [ "$PORT_FLAG" = "0" ]; then
+            PANEL_URL="$EXISTING_URL"
+        else
+            local ip
+            ip="$(detect_public_ip)"
+            PANEL_URL="http://${ip}:${PANEL_PORT}"
+        fi
     fi
 }
 
@@ -517,11 +531,25 @@ start_stack() {
 
 wait_health() {
     step "Проверка панели"
-    local attempt
+    local attempt cid status
     for attempt in $(seq 1 60); do
         if curl -fsS --max-time 3 "http://127.0.0.1:${PANEL_PORT}/healthz" >/dev/null 2>&1; then
             ok "Панель отвечает (попытка $attempt)"
             return 0
+        fi
+        # если контейнер упал — не ждём две минуты впустую
+        if [ $((attempt % 4)) -eq 0 ]; then
+            cid="$(compose ps -q panel 2>/dev/null | head -1 || true)"
+            if [ -n "$cid" ] && command -v docker >/dev/null 2>&1; then
+                status="$(docker inspect -f '{{.State.Status}}' "$cid" 2>/dev/null || true)"
+                case "$status" in
+                    exited|dead)
+                        warn "Контейнер панели остановился — последние строки лога:"
+                        compose logs --tail=30 panel >&2 || true
+                        return 1
+                        ;;
+                esac
+            fi
         fi
         sleep 2
     done
