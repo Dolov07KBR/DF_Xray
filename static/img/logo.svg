@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" role="img" aria-label="DF_Xray">
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#8b6bff"/>
+      <stop offset="55%" stop-color="#5b78ff"/>
+      <stop offset="100%" stop-color="#3ea8ff"/>
+    </linearGradient>
+    <linearGradient id="shine" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#ffffff" stop-opacity=".32"/>
+      <stop offset="60%" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="128" fill="url(#g)"/>
+  <rect width="512" height="512" rx="128" fill="url(#shine)"/>
+  <text x="256" y="336" text-anchor="middle" fill="#ffffff"
+        font-family="Inter, -apple-system, 'Segoe UI', Arial, sans-serif"
+        font-size="212" font-weight="800" letter-spacing="-10">DF</text>
+</svg>
