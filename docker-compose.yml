@@ -11,7 +11,7 @@ services:
     container_name: dfxray-panel
     restart: unless-stopped
     ports:
-      - "${PANEL_PORT:-8000}:8000"
+      - "${PANEL_BIND:-0.0.0.0}:${PANEL_PORT:-8000}:8000"
     environment:
       DFX_PORT: "8000"
       DFX_ADMIN_USERNAME: "${DFX_ADMIN_USERNAME:-admin}"
@@ -28,6 +28,25 @@ services:
       timeout: 5s
       retries: 3
       start_period: 15s
+    networks: [dfxray]
+
+  # Автоматический HTTPS. Включается профилем tls и требует Caddyfile
+  # (его создаёт install.sh при установке с --domain).
+  caddy:
+    image: caddy:2-alpine
+    container_name: dfxray-caddy
+    restart: unless-stopped
+    profiles: ["tls"]
+    depends_on:
+      panel:
+        condition: service_started
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
     networks: [dfxray]
 
   node-de:
@@ -76,6 +95,8 @@ services:
 volumes:
   dfxray-data:
   node-de-config:
+  caddy-data:
+  caddy-config:
   # node-nl-config:
 
 networks:

@@ -3,7 +3,7 @@ PYTHON ?= python3
 PORT   ?= 8000
 DATA   ?= ./data
 
-.PHONY: help run seed check test reset-password docker-up docker-down docker-logs clean
+.PHONY: help run seed check test lint reset-password docker-up docker-down docker-logs clean
 
 help: ## Показать список команд
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-16s\033[0m %s\n", $$1, $$2}'
@@ -19,6 +19,10 @@ check: ## Показать состояние базы
 
 test: ## Запустить тесты
 	$(PYTHON) -m unittest discover -s tests -v
+
+lint: ## Проверить Python (ruff) и shell-скрипты (shellcheck)
+	ruff check app tests node
+	shellcheck -S style install.sh bin/dfxray
 
 reset-password: ## Сбросить пароль администратора
 	DFX_DATA_DIR=$(DATA) $(PYTHON) -m app reset-password

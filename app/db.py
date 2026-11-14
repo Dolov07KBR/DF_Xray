@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import sqlite3
+import sys
 from collections.abc import Iterable
 from typing import Any
 
@@ -258,7 +259,8 @@ def init() -> None:
                 "[dfxray] ВНИМАНИЕ: создан администратор по умолчанию "
                 f"{username}/{password}. Смените пароль в настройках "
                 "или задайте DFX_ADMIN_PASSWORD.",
+                file=sys.stderr,
                 flush=True,
             )
         else:
-            print(f"[dfxray] Создан администратор {username!r}.", flush=True)
+            print(f"[dfxray] Создан администратор {username!r}.", file=sys.stderr, flush=True)

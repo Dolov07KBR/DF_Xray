@@ -92,6 +92,28 @@ Python-зависимости.
 
 ## Быстрый старт
 
+### Установка на VPS одной командой
+
+Свежий сервер (Ubuntu/Debian, CentOS/Fedora, Alpine), root-доступ и, желательно, домен:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Dolov07KBR/DF_Xray/main/install.sh | sudo bash
+```
+
+Установщик поставит Docker, загрузит панель в `/opt/dfxray`, сгенерирует пароль
+администратора, соберёт контейнеры и напечатает адрес, логин и пароль.
+
+Домен и HTTPS (Caddy + Let's Encrypt) плюс нода Xray на том же сервере:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Dolov07KBR/DF_Xray/main/install.sh \
+  | sudo bash -s -- --domain panel.example.com --with-node
+```
+
+Флаги: `--with-node`, `--no-node`, `--node-port`, `--admin-password`, `--seed-demo`,
+`--port`, `--dir`, `--dry-run`, `--uninstall`. Подробности — [docs/INSTALL.md](docs/INSTALL.md).
+После установки доступна команда `dfxray`: `status`, `logs`, `password`, `backup`, `update`.
+
 ### Docker Compose (рекомендуется)
 
 ```bash

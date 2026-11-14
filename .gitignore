@@ -17,6 +17,10 @@ venv/
 # окружение
 .env
 .env.local
+.env.bak*
+.credentials
+# генерируется установщиком при HTTPS
+Caddyfile
 
 # редакторы / ОС
 .DS_Store

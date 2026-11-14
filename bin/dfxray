@@ -1,0 +1,260 @@
+#!/usr/bin/env bash
+# DF_Xray Panel — управление установкой (генерируется install.sh).
+# Устанавливается как /usr/local/bin/dfxray.
+set -Eeuo pipefail
+
+CONF="${DFX_CONF:-/etc/dfxray/install.conf}"
+DFX_HOME="${DFX_HOME:-/opt/dfxray}"
+PANEL_PORT="${PANEL_PORT:-8000}"
+PANEL_BIND="${PANEL_BIND:-0.0.0.0}"
+PANEL_URL="${PANEL_URL:-}"
+PANEL_DOMAIN="${PANEL_DOMAIN:-}"
+PANEL_USER="${PANEL_USER:-admin}"
+COMPOSE_CMD="${COMPOSE_CMD:-docker compose}"
+REPO="${DFX_REPO:-Dolov07KBR/DF_Xray}"
+REF="${DFX_REF:-main}"
+
+if [ -t 1 ] && [ "${NO_COLOR:-0}" != "1" ]; then
+    C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'; C_DIM=$'\033[2m'
+    C_GREEN=$'\033[32m'; C_YELLOW=$'\033[33m'; C_RED=$'\033[31m'; C_CYAN=$'\033[36m'
+else
+    C_RESET=""; C_BOLD=""; C_DIM=""; C_GREEN=""; C_YELLOW=""; C_RED=""; C_CYAN=""
+fi
+
+info() { printf '%s•%s %s\n' "$C_CYAN" "$C_RESET" "$*"; }
+warn() { printf '%s!%s %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2; }
+die()  { printf '%s✗%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; exit 1; }
+
+if [ -f "$CONF" ]; then
+    # shellcheck disable=SC1090
+    . "$CONF"
+fi
+
+COMPOSE_BIN=(docker compose)
+if ! docker compose version >/dev/null 2>&1; then
+    if command -v docker-compose >/dev/null 2>&1; then
+        COMPOSE_BIN=(docker-compose)
+    fi
+fi
+read -r -a _cfg <<<"$COMPOSE_CMD"
+if [ "${#_cfg[@]}" -gt 0 ] && [ -n "${_cfg[0]:-}" ]; then
+    COMPOSE_BIN=("${_cfg[@]}")
+fi
+
+compose() {
+    "${COMPOSE_BIN[@]}" --project-directory "$DFX_HOME" -f "$DFX_HOME/docker-compose.yml" "$@"
+}
+
+env_value() {
+    local key="$1"
+    [ -f "$DFX_HOME/.env" ] || return 0
+    grep -E "^${key}=" "$DFX_HOME/.env" | head -1 | cut -d= -f2- || true
+}
+
+set_env_value() {
+    local key="$1" value="$2" file="$DFX_HOME/.env"
+    [ -f "$file" ] || return 0
+    local escaped
+    escaped="$(printf '%s' "$value" | sed -e 's/[\/&]/\\&/g')"
+    if grep -qE "^${key}=" "$file"; then
+        sed -i "s/^${key}=.*/${key}=${escaped}/" "$file"
+    else
+        printf '%s=%s\n' "$key" "$value" >>"$file"
+    fi
+}
+
+require_home() {
+    [ -f "$DFX_HOME/docker-compose.yml" ] || die "Не найден $DFX_HOME/docker-compose.yml. Панель установлена?"
+}
+
+panel_healthy() {
+    curl -fsS --max-time 3 "http://127.0.0.1:${PANEL_PORT}/healthz" >/dev/null 2>&1
+}
+
+gen_password() {
+    local value=""
+    if command -v openssl >/dev/null 2>&1; then
+        value="$(openssl rand -base64 32 | tr -dc 'A-Za-z0-9' | cut -c1-20)"
+    fi
+    [ -n "$value" ] || value="$(dd if=/dev/urandom bs=32 count=1 2>/dev/null | base64 | tr -dc 'A-Za-z0-9' | cut -c1-20)"
+    printf '%s' "$value"
+}
+
+cmd_help() {
+    cat <<EOF
+${C_BOLD}dfxray${C_RESET} — управление DF_Xray Panel
+
+  status              состояние контейнеров и панели
+  up                  запустить панель (+ ноду, если настроена)
+  down                остановить контейнеры
+  restart             перезапустить
+  logs [сервис]       логи (panel, node-de, caddy); -f для слежения
+  password [новый]    сменить пароль администратора
+  backup [файл]       копия базы (по умолчанию ~/dfxray-backup-<дата>.db)
+  update [--ref ref]  обновить панель до свежих исходников
+  uninstall           удалить контейнеры и команду (данные сохраняются)
+  url                 адрес панели
+  shell               оболочка внутри контейнера панели
+  version             версия панели
+  help                эта справка
+
+Каталог установки: $DFX_HOME
+EOF
+}
+
+cmd_status() {
+    require_home
+    printf '%sDF_Xray Panel%s\n' "$C_BOLD" "$C_RESET"
+    printf '  Каталог: %s\n' "$DFX_HOME"
+    printf '  URL:     %s\n' "${PANEL_URL:-http://127.0.0.1:$PANEL_PORT}"
+    printf '  Домен:   %s\n' "${PANEL_DOMAIN:-—}"
+    printf '\n'
+    compose ps
+    printf '\n'
+    if panel_healthy; then
+        printf '  %s✓%s Панель отвечает на 127.0.0.1:%s\n' "$C_GREEN" "$C_RESET" "$PANEL_PORT"
+    else
+        printf '  %s✗%s Панель не отвечает на 127.0.0.1:%s (см. dfxray logs panel)\n' "$C_RED" "$C_RESET" "$PANEL_PORT"
+    fi
+    local token
+    token="$(env_value NODE_TOKEN)"
+    if [ -n "$token" ]; then
+        printf '  %s✓%s Нода настроена (порт %s)\n' "$C_GREEN" "$C_RESET" "$(env_value NODE_PORT)"
+    else
+        printf '  %s—%s Нода не настроена (Ноды → Добавить ноду)\n' "$C_DIM" "$C_RESET"
+    fi
+    if [ -n "$PANEL_DOMAIN" ]; then
+        printf '  HTTPS:   https://%s (Caddy)\n' "$PANEL_DOMAIN"
+    fi
+}
+
+cmd_up() {
+    require_home
+    compose up -d panel
+    if [ -n "$PANEL_DOMAIN" ]; then compose up -d caddy; fi
+    if [ -n "$(env_value NODE_TOKEN)" ]; then compose up -d node-de; fi
+    info "Запущено. Проверка: dfxray status"
+}
+
+cmd_down() {
+    require_home
+    compose down
+    info "Контейнеры остановлены"
+}
+
+cmd_restart() {
+    require_home
+    compose restart
+    info "Перезапущено"
+}
+
+cmd_logs() {
+    require_home
+    local follow=() service=""
+    for arg in "$@"; do
+        case "$arg" in
+            -f|--follow) follow=(-f) ;;
+            *) service="$arg" ;;
+        esac
+    done
+    if [ -n "$service" ]; then
+        compose logs --tail=200 "${follow[@]}" "$service"
+    else
+        compose logs --tail=200 "${follow[@]}"
+    fi
+}
+
+cmd_password() {
+    require_home
+    local new="${1:-}"
+    if [ -z "$new" ]; then
+        new="$(gen_password)"
+        info "Сгенерирован новый пароль"
+    fi
+    [ "${#new}" -ge 8 ] || die "Пароль должен быть не короче 8 символов."
+    compose exec -T panel python -m app reset-password --username "$PANEL_USER" --password "$new" \
+        || die "Не удалось сменить пароль (панель запущена?)"
+    set_env_value DFX_ADMIN_PASSWORD "$new"
+    if [ -f "$DFX_HOME/.credentials" ]; then
+        sed -i "s/^PASSWORD=.*/PASSWORD=$new/" "$DFX_HOME/.credentials"
+    fi
+    printf '\n  Логин:  %s\n  Пароль: %s\n\n' "$PANEL_USER" "$new"
+}
+
+cmd_backup() {
+    require_home
+    local out="${1:-$HOME/dfxray-backup-$(date +%Y%m%d-%H%M%S).db}"
+    local inside="/tmp/dfxray-backup.db"
+    info "Делаю копию базы"
+    compose exec -T panel python -m app backup -o "$inside" >/dev/null
+    local cid
+    cid="$(compose ps -q panel)"
+    [ -n "$cid" ] || die "Контейнер панели не запущен"
+    docker cp "$cid:$inside" "$out" >/dev/null
+    compose exec -T panel rm -f "$inside" >/dev/null 2>&1 || true
+    printf '  %s✓%s Бэкап: %s (%s)\n' "$C_GREEN" "$C_RESET" "$out" "$(du -h "$out" | cut -f1)"
+}
+
+cmd_update() {
+    require_home
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --ref) REF="${2:-$REF}"; shift 2 ;;
+            *) die "Неизвестный флаг: $1" ;;
+        esac
+    done
+    local url="https://raw.githubusercontent.com/$REPO/$REF/install.sh"
+    local tmp="/tmp/dfxray-update-$$.sh"
+    info "Скачиваю установщик ($REF)"
+    curl -fsSL --max-time 60 "$url" -o "$tmp" || die "Не удалось скачать $url"
+    local args=(--dir "$DFX_HOME" --yes --ref "$REF")
+    [ -n "$PANEL_DOMAIN" ] && args+=(--domain "$PANEL_DOMAIN")
+    [ -n "$(env_value NODE_TOKEN)" ] && args+=(--with-node)
+    info "Обновляю панель (данные и .env сохраняются)"
+    bash "$tmp" "${args[@]}"
+    rm -f "$tmp"
+}
+
+cmd_uninstall() {
+    require_home
+    local installer="$DFX_HOME/install.sh"
+    [ -f "$installer" ] || die "Не найден $installer"
+    exec bash "$installer" --uninstall --dir "$DFX_HOME"
+}
+
+cmd_shell() {
+    require_home
+    compose exec panel sh
+}
+
+cmd_version() {
+    require_home
+    compose exec -T panel python -m app --version 2>/dev/null || echo "DF_Xray Panel"
+}
+
+cmd_url() {
+    printf '%s\n' "${PANEL_URL:-http://127.0.0.1:$PANEL_PORT}"
+}
+
+main() {
+    local command="${1:-help}"
+    [ $# -gt 0 ] && shift
+    case "$command" in
+        help|-h|--help) cmd_help ;;
+        status|st|ps)   cmd_status ;;
+        up|start)       cmd_up ;;
+        down|stop)      cmd_down ;;
+        restart)        cmd_restart ;;
+        logs|log)       cmd_logs "$@" ;;
+        password|passwd) cmd_password "$@" ;;
+        backup)         cmd_backup "$@" ;;
+        update|upgrade) cmd_update "$@" ;;
+        uninstall|remove) cmd_uninstall ;;
+        shell|sh)       cmd_shell ;;
+        url)            cmd_url ;;
+        version|-V|--version) cmd_version ;;
+        *) die "Неизвестная команда: $command (dfxray help)" ;;
+    esac
+}
+
+main "$@"
