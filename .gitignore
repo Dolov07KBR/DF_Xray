@@ -1,0 +1,30 @@
+# данные панели
+data/
+*.db
+*.db-wal
+*.db-shm
+backup*.sqlite
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# окружение
+.env
+.env.local
+.env.bak*
+.credentials
+# генерируется установщиком при HTTPS
+Caddyfile
+
+# редакторы / ОС
+.DS_Store
+.idea/
+.vscode/
+*.swp
+node_modules/

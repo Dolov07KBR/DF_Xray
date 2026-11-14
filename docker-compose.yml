@@ -1,0 +1,104 @@
+# DF_Xray Panel + нода Xray.
+# 1) cp .env.example .env && отредактируйте пароль/адрес
+# 2) docker compose up -d panel
+# 3) В панели: Ноды → Добавить ноду → скопировать токен
+# 4) Вписать токен в .env (NODE_TOKEN) и запустить: docker compose up -d node-de
+
+services:
+  panel:
+    build: .
+    image: ghcr.io/dfxray/panel:latest
+    container_name: dfxray-panel
+    restart: unless-stopped
+    ports:
+      - "${PANEL_BIND:-0.0.0.0}:${PANEL_PORT:-8000}:8000"
+    environment:
+      DFX_PORT: "8000"
+      DFX_ADMIN_USERNAME: "${DFX_ADMIN_USERNAME:-admin}"
+      DFX_ADMIN_PASSWORD: "${DFX_ADMIN_PASSWORD:-}"
+      DFX_BASE_URL: "${DFX_BASE_URL:-}"
+      DFX_SEED_DEMO: "${DFX_SEED_DEMO:-0}"
+      DFX_TRUST_PROXY: "1"
+      DFX_SESSION_TTL_HOURS: "${DFX_SESSION_TTL_HOURS:-168}"
+    volumes:
+      - dfxray-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=4)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    networks: [dfxray]
+
+  # Автоматический HTTPS. Включается профилем tls и требует Caddyfile
+  # (его создаёт install.sh при установке с --domain).
+  caddy:
+    image: caddy:2-alpine
+    container_name: dfxray-caddy
+    restart: unless-stopped
+    profiles: ["tls"]
+    depends_on:
+      panel:
+        condition: service_started
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    networks: [dfxray]
+
+  node-de:
+    build:
+      context: ./node
+      args:
+        XRAY_VERSION: "${XRAY_VERSION:-25.9.11}"
+    image: ghcr.io/dfxray/node:latest
+    container_name: dfxray-node-de
+    restart: unless-stopped
+    depends_on:
+      panel:
+        condition: service_healthy
+    environment:
+      DFX_PANEL_URL: "${PANEL_INTERNAL_URL:-http://panel:8000}"
+      DFX_NODE_TOKEN: "${NODE_TOKEN:-}"
+      DFX_POLL: "${NODE_POLL:-30}"
+      DFX_LOG_LEVEL: "${NODE_LOG_LEVEL:-info}"
+    ports:
+      - "${NODE_PORT:-443}:443"
+    volumes:
+      - node-de-config:/etc/xray
+    networks: [dfxray]
+
+  # Вторая нода: раскомментируйте и задайте отдельный токен.
+  # node-nl:
+  #   build:
+  #     context: ./node
+  #     args:
+  #       XRAY_VERSION: "${XRAY_VERSION:-25.9.11}"
+  #   image: ghcr.io/dfxray/node:latest
+  #   container_name: dfxray-node-nl
+  #   restart: unless-stopped
+  #   depends_on:
+  #     panel:
+  #       condition: service_healthy
+  #   environment:
+  #     DFX_PANEL_URL: "${PANEL_INTERNAL_URL:-http://panel:8000}"
+  #     DFX_NODE_TOKEN: "${NODE_TOKEN_NL:-}"
+  #   ports:
+  #     - "8443:8443"
+  #   volumes:
+  #     - node-nl-config:/etc/xray
+  #   networks: [dfxray]
+
+volumes:
+  dfxray-data:
+  node-de-config:
+  caddy-data:
+  caddy-config:
+  # node-nl-config:
+
+networks:
+  dfxray:
+    driver: bridge

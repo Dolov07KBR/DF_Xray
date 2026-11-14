@@ -1,0 +1,12 @@
+{
+  "name": "DF_Xray Panel",
+  "short_name": "DF_Xray",
+  "description": "Лёгкая панель управления Xray",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#070910",
+  "theme_color": "#070910",
+  "icons": [
+    { "src": "/static/img/logo.svg", "sizes": "any", "type": "image/svg+xml" }
+  ]
+}
