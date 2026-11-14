@@ -105,6 +105,43 @@ def run(demo: bool = True, force: bool = False) -> None:
             (iso(now() - dt.timedelta(seconds=25 + 20 * node_id)), node_id),
         )
 
+    groups = ["Семья", "Работа", "Тесты"]
+    colors = ["#7c5cff", "#3fb950", "#4f8cff"]
+    group_ids: list[int] = []
+    for index, group_name in enumerate(groups):
+        try:
+            group_ids.append(
+                repo.create_group({"name": group_name, "color": colors[index % len(colors)]})
+            )
+        except ValueError:
+            row = db.one("SELECT id FROM groups WHERE name = ?", (group_name,))
+            if row:
+                group_ids.append(int(row["id"]))
+
+    outbounds = [
+        {
+            "name": "Германия SOCKS",
+            "tag": "de-socks",
+            "type": "socks",
+            "address": "10.8.0.2",
+            "port": 1080,
+            "username": "dfx",
+            "password": "demo-pass",
+            "sort": 20,
+        },
+        {
+            "name": "Резервный HTTP",
+            "tag": "backup-http",
+            "type": "http",
+            "address": "10.8.0.3",
+            "port": 3128,
+            "sort": 40,
+        },
+    ]
+    if db.scalar("SELECT COUNT(*) FROM outbounds") == 0:
+        for outbound in outbounds:
+            repo.create_outbound(outbound)
+
     for idx, (username, email, limit_gb, days, devices, state) in enumerate(DEMO_USERS):
         user_id = repo.create_user(
             {
@@ -115,6 +152,7 @@ def run(demo: bool = True, force: bool = False) -> None:
                 "device_limit": devices,
                 "note": "демо-пользователь",
                 "flow": "xtls-rprx-vision" if idx % 2 == 0 else "",
+                "group_id": group_ids[idx % len(group_ids)] if group_ids else 0,
             }
         )
         enabled = state not in ("disabled",)

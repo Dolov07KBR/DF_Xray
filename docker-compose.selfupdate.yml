@@ -1,0 +1,16 @@
+# Обновление панели прямо из интерфейса.
+#
+# Подключается вторым файлом вместе с docker-compose.yml:
+#   docker compose -f docker-compose.yml -f docker-compose.selfupdate.yml up -d panel
+# install.sh и dfxray подключают его автоматически, если файл лежит рядом.
+#
+# Код панели монтируется из каталога установки в /app, поэтому кнопка «Обновить»
+# может заменить файлы на хосте; контейнер перезапускается по restart policy.
+# Нужен только для панели: ноды и Caddy не затрагиваются.
+services:
+  panel:
+    environment:
+      DFX_SELF_UPDATE: "1"
+    volumes:
+      - dfxray-data:/data
+      - ./:/app:rw

@@ -10,7 +10,7 @@ from typing import Any
 
 from . import config
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS settings (
@@ -69,6 +69,14 @@ CREATE TABLE IF NOT EXISTS nodes (
     updated_at    TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS groups (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    name       TEXT NOT NULL UNIQUE,
+    color      TEXT NOT NULL DEFAULT '',
+    note       TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS users (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
     username       TEXT NOT NULL UNIQUE,
@@ -84,6 +92,7 @@ CREATE TABLE IF NOT EXISTS users (
     down_bytes     INTEGER NOT NULL DEFAULT 0,
     device_limit   INTEGER NOT NULL DEFAULT 0,
     node_ids       TEXT,
+    group_id       INTEGER REFERENCES groups(id) ON DELETE SET NULL,
     last_online_at TEXT,
     last_sub_at    TEXT,
     created_at     TEXT NOT NULL,
@@ -97,6 +106,22 @@ CREATE TABLE IF NOT EXISTS traffic (
     up      INTEGER NOT NULL DEFAULT 0,
     down    INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (user_id, node_id, day)
+);
+
+CREATE TABLE IF NOT EXISTS outbounds (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    name       TEXT NOT NULL,
+    tag        TEXT NOT NULL,
+    type       TEXT NOT NULL DEFAULT 'direct',
+    address    TEXT NOT NULL DEFAULT '',
+    port       INTEGER NOT NULL DEFAULT 0,
+    username   TEXT NOT NULL DEFAULT '',
+    password   TEXT NOT NULL DEFAULT '',
+    sni        TEXT NOT NULL DEFAULT '',
+    enabled    INTEGER NOT NULL DEFAULT 1,
+    sort       INTEGER NOT NULL DEFAULT 100,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS audit (
@@ -136,6 +161,16 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "traffic_retention_days": "90",
     "password_changed": "0",
     "footer_note": "",
+    # маршрутизация / исходящие
+    "route_default_outbound": "",
+    # обновления
+    "update_auto": "1",
+    "update_check_ts": "",
+    "update_latest": "",
+    "update_url": "",
+    "update_notes": "",
+    "update_command": "",
+    "install_dir": "/opt/dfxray",
 }
 
 
@@ -235,6 +270,16 @@ def update_settings(values: dict[str, Any]) -> None:
             )
 
 
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Догоняющие миграции для баз, созданных старой версией."""
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(users)")}
+    if "group_id" not in columns:
+        conn.execute(
+            "ALTER TABLE users ADD COLUMN group_id INTEGER "
+            "REFERENCES groups(id) ON DELETE SET NULL"
+        )
+
+
 def init() -> None:
     """Создать схему, настройки по умолчанию и первого администратора."""
     from . import auth
@@ -242,6 +287,7 @@ def init() -> None:
     config.ensure_dirs()
     with get() as conn:
         conn.executescript(SCHEMA)
+        _migrate(conn)
         version = conn.execute("PRAGMA user_version").fetchone()[0]
         if version < SCHEMA_VERSION:
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")

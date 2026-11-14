@@ -6,14 +6,20 @@ import {
 
 const SECTIONS = [
   { id: 'general', label: 'Общие', icon: 'settings' },
-  { id: 'subscription', label: 'Подписка', icon: 'link' },
-  { id: 'routing', label: 'Маршрутизация', icon: 'globe' },
+  { id: 'subscription', label: 'Подписки', icon: 'link' },
   { id: 'security', label: 'Безопасность', icon: 'shield' },
-  { id: 'maintenance', label: 'Обслуживание', icon: 'refresh' },
+  { id: 'update', label: 'Обновление', icon: 'refresh' },
+  { id: 'maintenance', label: 'Обслуживание', icon: 'download' },
   { id: 'about', label: 'О панели', icon: 'info' },
 ];
 
-let activeSection = 'general';
+function sectionFromHash() {
+  const query = window.location.hash.split('?')[1] || '';
+  const value = new URLSearchParams(query).get('section') || '';
+  return SECTIONS.some((item) => item.id === value) ? value : 'general';
+}
+
+let activeSection = sectionFromHash();
 
 function sw(name, label, checked, hint = '') {
   return `<div class="field">
@@ -96,37 +102,6 @@ function sectionHtml(id, settings) {
       </div>
     </form>`;
   }
-  if (id === 'routing') {
-    return `<form class="card" data-form="routing">
-      <div class="card-head">
-        <div><h3>Маршрутизация и DNS</h3>
-          <div class="hint">Применяется к новым конфигам нод при следующем опросе агента.</div></div>
-      </div>
-      <div class="card-body">
-        <div class="form-grid">
-          ${sw('block_bittorrent', 'Блокировать BitTorrent', settings.block_bittorrent, 'По протоколу bittorrent — снижает риск абуза.')}
-          ${sw('block_ads', 'Блокировать рекламу', settings.block_ads, 'Через geosite:category-ads-all (нужен geosite.dat).')}
-          ${sw('block_private', 'Блокировать приватные IP', settings.block_private, 'Защита от SSRF в локальную сеть.')}
-          ${sw('route_ru_direct', 'Российские сайты — напрямую', settings.route_ru_direct, 'geosite:category-ru и geoip:ru идут мимо туннеля.')}
-          <div class="field">
-            <label>DNS</label>
-            <select class="select" name="dns_preset">
-              <option value="cloudflare" ${settings.dns_preset === 'cloudflare' ? 'selected' : ''}>Cloudflare 1.1.1.1</option>
-              <option value="google" ${settings.dns_preset === 'google' ? 'selected' : ''}>Google 8.8.8.8</option>
-              <option value="quad9" ${settings.dns_preset === 'quad9' ? 'selected' : ''}>Quad9 9.9.9.9</option>
-              <option value="system" ${settings.dns_preset === 'system' ? 'selected' : ''}>Системный</option>
-            </select>
-          </div>
-          <div class="field">
-            <label>Период хранения статистики, дней</label>
-            <input class="input" name="traffic_retention_days" type="number" min="7" max="3650" value="${settings.traffic_retention_days}">
-            <div class="hint">Старые срезы трафика удаляются при обслуживании.</div>
-          </div>
-        </div>
-        <div style="margin-top:16px"><button class="btn btn-primary" type="submit">Сохранить</button></div>
-      </div>
-    </form>`;
-  }
   if (id === 'security') {
     return `
       <div class="card">
@@ -158,6 +133,45 @@ function sectionHtml(id, settings) {
             Пароль хранится как PBKDF2-SHA256 (210 000 итераций), сессии — в SQLite, cookie HttpOnly + SameSite=Lax.
           </p>
           <button class="btn btn-danger" data-act="revoke">${icon('logout')}Завершить другие сессии</button>
+        </div>
+      </div>`;
+  }
+  if (id === 'update') {
+    return `
+      <div class="card">
+        <div class="card-head">
+          <div><h3>Обновление панели</h3>
+            <div class="hint">Проверка новых версий и установка прямо из интерфейса.</div></div>
+          <span id="update-badge" class="chip chip-quiet">проверка…</span>
+        </div>
+        <div class="card-body">
+          <div class="kv"><span>Текущая версия</span><b class="mono" id="update-current">${esc(settings.version)}</b></div>
+          <div class="kv"><span>Последняя версия</span><b class="mono" id="update-latest">—</b></div>
+          <div class="kv"><span>Проверено</span><b id="update-checked">—</b></div>
+          <div class="kv"><span>Способ обновления</span><b id="update-mode">—</b></div>
+          <div class="update-notes" id="update-notes"></div>
+          <div style="display:flex;gap:8px;margin-top:16px;flex-wrap:wrap">
+            <button class="btn" data-act="check-update">${icon('refresh')}Проверить обновления</button>
+            <button class="btn btn-primary" data-act="apply-update" disabled>${icon('download')}Обновить сейчас</button>
+            <a class="btn" href="https://github.com/Dolov07KBR/DF_Xray/releases" target="_blank" rel="noopener">${icon('external')}Релизы</a>
+          </div>
+          <pre class="code-block update-log" id="update-log" hidden></pre>
+          <p class="hint" style="margin-top:12px;line-height:1.7" id="update-hint">
+            Автообновление работает, если у панели есть доступ к установщику или Docker.
+            На VPS без этого доступна команда <code class="mono">dfxray update</code>.
+          </p>
+        </div>
+      </div>
+      <div class="card" style="margin-top:16px">
+        <div class="card-head"><h3>Каналы</h3></div>
+        <div class="card-body">
+          <div class="kv"><span>Репозиторий</span><b class="mono">Dolov07KBR/DF_Xray</b></div>
+          <div class="kv"><span>Канал</span><b>стабильный (main / релизы)</b></div>
+          <div class="kv"><span>Проверка</span><b>при входе и вручную, кэш 6 часов</b></div>
+          <label class="switch" style="margin-top:12px">
+            <input type="checkbox" name="update_auto" id="update-auto" ${settings.update_auto ? 'checked' : ''}>
+            <span class="track"></span><span class="label">Проверять обновления автоматически</span>
+          </label>
         </div>
       </div>`;
   }
@@ -200,9 +214,144 @@ function sectionHtml(id, settings) {
     </div>`;
 }
 
+
+/* --------------------------------------------------------------- обновления --- */
+
+let updateTimer = null;
+
+function fmtStamp(value) {
+  const n = Number(value);
+  if (!n) return '—';
+  try {
+    return new Date(n * 1000).toLocaleString('ru-RU', { dateStyle: 'short', timeStyle: 'short' });
+  } catch (err) { return '—'; }
+}
+
+function paintUpdate(container, data) {
+  const badge = container.querySelector('#update-badge');
+  const latest = container.querySelector('#update-latest');
+  const checked = container.querySelector('#update-checked');
+  const mode = container.querySelector('#update-mode');
+  const notes = container.querySelector('#update-notes');
+  const applyBtn = container.querySelector('[data-act="apply-update"]');
+  if (!badge || !latest) return;
+
+  const capability = data.capability || {};
+  const current = data.current || (state.settings && state.settings.version) || '';
+  if (data.error) {
+    badge.className = 'chip chip-warn';
+    badge.textContent = 'нет данных';
+    notes.innerHTML = `<div class="notice warn">${esc(data.error)}</div>`;
+  } else if (data.update_available) {
+    badge.className = 'chip chip-accent';
+    badge.textContent = `доступна ${data.latest}`;
+  } else {
+    badge.className = 'chip chip-quiet';
+    badge.textContent = 'актуально';
+  }
+  latest.textContent = data.latest || '—';
+  checked.textContent = data.checked_at ? fmtStamp(data.checked_at) : '—';
+  mode.textContent = capability.label || '—';
+  if (capability.hint) mode.title = capability.hint;
+  if (notes && data.notes) {
+    notes.innerHTML = `<div class="update-notes-body">${esc(data.notes).slice(0, 1200)}</div>`;
+  } else if (notes) {
+    notes.innerHTML = '';
+  }
+  if (applyBtn) {
+    const canApply = Boolean(data.update_available) && capability.mode !== 'manual';
+    applyBtn.disabled = !canApply;
+    applyBtn.title = canApply
+      ? (capability.hint || 'Запустить обновление')
+      : 'Автообновление недоступно — обновите панель на сервере';
+  }
+  if (data.status) paintUpdateLog(container, data.status);
+  void current;
+}
+
+function paintUpdateLog(container, status) {
+  const log = container.querySelector('#update-log');
+  if (!log) return;
+  const text = status.log || '';
+  if (!text) {
+    log.hidden = true;
+    return;
+  }
+  log.hidden = false;
+  log.textContent = text;
+  log.scrollTop = log.scrollHeight;
+  if (status.running && !updateTimer) {
+    updateTimer = setInterval(() => pollUpdateStatus(container), 2500);
+  }
+  if (!status.running && updateTimer) {
+    clearInterval(updateTimer);
+    updateTimer = null;
+  }
+}
+
+async function pollUpdateStatus(container) {
+  try {
+    const status = await api('/api/updates/status');
+    paintUpdateLog(container, status);
+    if (!status.running) {
+      if (status.ok) toast('Обновление завершено');
+      else toast('Обновление завершилось с ошибкой — смотрите лог', 'err');
+    }
+  } catch (err) {
+    if (updateTimer) clearInterval(updateTimer);
+    updateTimer = null;
+  }
+}
+
+async function hydrateUpdate(container) {
+  try {
+    const data = await api('/api/updates');
+    paintUpdate(container, data);
+  } catch (err) {
+    toast(err.message, 'err');
+  }
+}
+
+async function runUpdateCheck(container, btn) {
+  if (btn) btn.disabled = true;
+  try {
+    const data = await api('/api/updates/check', { method: 'POST' });
+    paintUpdate(container, data);
+    toast(data.update_available ? `Доступна версия ${data.latest}` : 'Обновлений нет');
+  } catch (err) {
+    toast(err.message, 'err');
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+async function runUpdateApply(container, btn) {
+  const ok = await confirmDialog({
+    title: 'Обновить панель?',
+    text: 'Панель запустит обновление и перезапустится. Сессия сохранится, данные в базе не изменятся.',
+    confirmText: 'Обновить',
+  });
+  if (!ok) return;
+  if (btn) btn.disabled = true;
+  try {
+    const result = await api('/api/updates/apply', { method: 'POST' });
+    toast('Обновление запущено');
+    const log = container.querySelector('#update-log');
+    if (log) {
+      log.hidden = false;
+      log.textContent = `$ ${result.command}\n`;
+    }
+    pollUpdateStatus(container);
+  } catch (err) {
+    toast(err.message, 'err');
+    if (btn) btn.disabled = false;
+  }
+}
+
 export async function render(container, ctx) {
   const { setActions } = ctx;
   setActions('');
+  if (window.location.hash.includes('section=')) activeSection = sectionFromHash();
   container.innerHTML = '<div class="skeleton" style="height:420px"></div>';
 
   const settings = await api('/api/settings');
@@ -225,12 +374,19 @@ export async function render(container, ctx) {
   };
 
   layout();
+  if (activeSection === 'update') hydrateUpdate(container);
 
   bind(container, 'click', async (ev) => {
     const sectionBtn = ev.target.closest('[data-section]');
     if (sectionBtn) {
       activeSection = sectionBtn.dataset.section;
+      const next = `#/settings?section=${activeSection}`;
+      if (window.location.hash !== next) {
+        window.location.hash = next;
+        return;
+      }
       layout();
+      if (activeSection === 'update') hydrateUpdate(container);
       return;
     }
     const action = ev.target.closest('[data-act]');
@@ -245,6 +401,10 @@ export async function render(container, ctx) {
         if (!ok) return;
         const result = await api('/api/account/sessions/revoke', { method: 'POST' });
         toast(`Завершено сессий: ${result.removed}`);
+      } else if (action.dataset.act === 'check-update') {
+        await runUpdateCheck(container, action);
+      } else if (action.dataset.act === 'apply-update') {
+        await runUpdateApply(container, action);
       } else if (action.dataset.act === 'purge') {
         const ok = await confirmDialog({
           title: 'Очистить старую статистику?',
@@ -306,22 +466,12 @@ function bindSettings(container) {
     });
   }
 
-  const routingForm = panel.querySelector('[data-form="routing"]');
-  if (routingForm) {
-    routingForm.addEventListener('submit', async (ev) => {
-      ev.preventDefault();
-      const f = routingForm;
-      const body = {
-        block_bittorrent: formChecked(f, 'block_bittorrent'),
-        block_ads: formChecked(f, 'block_ads'),
-        block_private: formChecked(f, 'block_private'),
-        route_ru_direct: formChecked(f, 'route_ru_direct'),
-        dns_preset: formValue(f, 'dns_preset', 'cloudflare'),
-        traffic_retention_days: Number(formValue(f, 'traffic_retention_days', '90') || 90),
-      };
+  const autoToggle = panel.querySelector('#update-auto');
+  if (autoToggle) {
+    autoToggle.addEventListener('change', async () => {
       try {
-        await api('/api/settings', { method: 'PATCH', body });
-        toast('Маршрутизация обновлена');
+        await api('/api/settings', { method: 'PATCH', body: { update_auto: autoToggle.checked } });
+        toast(autoToggle.checked ? 'Автопроверка включена' : 'Автопроверка выключена');
       } catch (err) { toast(err.message, 'err'); }
     });
   }

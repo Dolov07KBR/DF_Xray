@@ -20,6 +20,7 @@ KNOWN_COMMANDS = (
     "node-token",
     "user-add",
     "backup",
+    "self-update",
 )
 
 
@@ -210,6 +211,19 @@ def cmd_backup(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_self_update(args: argparse.Namespace) -> int:
+    """Обновить код панели из GitHub (используется кнопкой в интерфейсе)."""
+    from app import updates
+
+    try:
+        result = updates.self_update(ref=args.ref, target=args.target)
+    except Exception as exc:  # печатаем причину для лога панели
+        print(f"ошибка обновления: {exc}", file=sys.stderr)
+        return 1
+    print(f"обновлено файлов: {result['files']} ({result['ref']} → {result['target']})")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="dfxray", description=config.APP_NAME)
     parser.add_argument("--version", action="version", version=config.APP_VERSION)
@@ -275,6 +289,11 @@ def build_parser() -> argparse.ArgumentParser:
     user_add.add_argument("--flow", default="")
     user_add.add_argument("--json", action="store_true")
     user_add.set_defaults(func=cmd_user_add)
+
+    self_update = sub.add_parser("self-update", help="обновить код панели из GitHub")
+    self_update.add_argument("--ref", default="main", help="ветка или тег (по умолчанию main)")
+    self_update.add_argument("--target", default="", help="каталог панели")
+    self_update.set_defaults(func=cmd_self_update)
 
     backup = sub.add_parser("backup", help="сделать копию базы")
     backup.add_argument("-o", "--output", required=True)

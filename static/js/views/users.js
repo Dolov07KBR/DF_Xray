@@ -5,8 +5,8 @@ import {
   initials, openDrawer, relTime, state, statusBadge, toast, usageBar, daysLabel,
 } from '../core.js';
 
-const filters = { q: '', status: 'all', sort: 'created_desc' };
-let cache = { items: [], summary: {}, nodes: [] };
+const filters = { q: '', status: 'all', sort: 'created_desc', group: 0 };
+let cache = { items: [], summary: {}, nodes: [], groups: [] };
 
 function avatarStyle(name) {
   let hash = 0;
@@ -17,7 +17,12 @@ function avatarStyle(name) {
 
 async function loadAll() {
   const [users, nodes] = await Promise.all([api('/api/users?limit=1000'), api('/api/nodes')]);
-  cache = { items: users.items, summary: users.summary, nodes: nodes.items };
+  cache = {
+    items: users.items,
+    summary: users.summary,
+    nodes: nodes.items,
+    groups: users.groups || [],
+  };
   return cache;
 }
 
@@ -32,6 +37,7 @@ function applyFilters() {
       || u.uuid.includes(q));
   }
   if (filters.status !== 'all') items = items.filter((u) => u.status === filters.status);
+  if (filters.group) items = items.filter((u) => Number(u.group_id) === Number(filters.group));
   if (filters.sort === 'traffic_desc') items.sort((a, b) => b.used_bytes - a.used_bytes);
   else if (filters.sort === 'traffic_asc') items.sort((a, b) => a.used_bytes - b.used_bytes);
   else if (filters.sort === 'name') items.sort((a, b) => a.username.localeCompare(b.username));
@@ -319,6 +325,13 @@ export function openUserForm(user = null) {
           <div class="hint">0 — бессрочно</div>
         </div>`}
         <div class="field">
+          <label>Группа</label>
+          <select class="select" name="group_id">
+            <option value="">без группы</option>
+            ${(cache.groups || []).map((group) => `<option value="${group.id}" ${user && Number(user.group_id) === group.id ? 'selected' : ''}>${esc(group.name)}</option>`).join('')}
+          </select>
+        </div>
+        <div class="field">
           <label>Flow (VLESS + TCP + TLS/Reality)</label>
           <select class="select" name="flow">
             <option value="">по умолчанию (нода)</option>
@@ -370,6 +383,7 @@ export function openUserForm(user = null) {
       note: data.note,
       enabled: formEl.querySelector('[name="enabled"]').checked,
       node_ids: nodesChecked,
+      group_id: data.group_id ? Number(data.group_id) : 0,
     };
     if (isEdit) {
       payload.expires_at = data.expires_at || '';
@@ -422,7 +436,15 @@ async function refreshTable() {
   }
 }
 
+function applyHashFilters() {
+  const query = (window.location.hash.split('?')[1] || '');
+  const params = new URLSearchParams(query);
+  if (params.get('q')) filters.q = params.get('q');
+  if (params.get('group')) filters.group = Number(params.get('group'));
+}
+
 export async function render(container, { setActions }) {
+  applyHashFilters();
   const actions = setActions(`
     <a class="btn" href="/api/users/export" download>${icon('download')}CSV</a>
     <button class="btn btn-primary" data-act="new">${icon('plus')}Новый пользователь</button>
@@ -445,6 +467,7 @@ export async function render(container, { setActions }) {
         <option value="expires">По дате окончания</option>
       </select>
       <div class="spacer"></div>
+      <span id="users-group" class="chips"></span>
       <span id="users-counts" class="chips" style="gap:10px;font-size:12px"></span>
     </div>
     <div class="card"><div id="users-table"><div style="padding:20px">${
@@ -466,6 +489,20 @@ export async function render(container, { setActions }) {
       </button>`).join('');
   };
   renderSegmented();
+
+  const groupHost = container.querySelector('#users-group');
+  if (groupHost) {
+    const current = cache.groups.find((group) => group.id === Number(filters.group));
+    groupHost.innerHTML = current
+      ? `<button class="chip chip-accent" data-clear-group>Группа: ${esc(current.name)} ✕</button>`
+      : '';
+    groupHost.addEventListener('click', (ev) => {
+      if (!ev.target.closest('[data-clear-group]')) return;
+      filters.group = 0;
+      refreshTable();
+      groupHost.innerHTML = '';
+    });
+  }
 
   const sortSelect = container.querySelector('#sort-filter');
   sortSelect.value = filters.sort;

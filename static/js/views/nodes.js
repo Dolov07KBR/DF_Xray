@@ -142,7 +142,7 @@ function syncVisibility(form) {
   show('flow', protocol === 'vless' && transport === 'tcp' && security !== 'none');
 }
 
-function openNodeForm(node = null, onSaved = null) {
+export function openNodeForm(node = null, onSaved = null) {
   const isEdit = Boolean(node);
   const modal = openModal({
     title: isEdit ? `Нода · ${node.name}` : 'Новая нода',

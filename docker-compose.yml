@@ -20,6 +20,9 @@ services:
       DFX_SEED_DEMO: "${DFX_SEED_DEMO:-0}"
       DFX_TRUST_PROXY: "1"
       DFX_SESSION_TTL_HOURS: "${DFX_SESSION_TTL_HOURS:-168}"
+      DFX_UPDATE_REPO: "${DFX_UPDATE_REPO:-}"
+      DFX_UPDATE_COMMAND: "${DFX_UPDATE_COMMAND:-}"
+      DFX_SELF_DIR: "${DFX_SELF_DIR:-/app}"
     volumes:
       - dfxray-data:/data
     healthcheck:

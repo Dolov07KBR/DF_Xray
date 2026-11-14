@@ -328,6 +328,168 @@ class PanelTestCase(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertTrue(body.startswith(b"SQLite format 3"))
 
+    # --- группы, исходящие, хосты, документация, обновления ---
+
+    def test_groups_crud(self):
+        self.login()
+        status, _, created = self.json_request(
+            "POST", "/api/groups", {"name": "Тест-группа", "color": "#3fb950", "note": "api"}
+        )
+        self.assertEqual(status, 201, created)
+        group_id = created["id"]
+        self.assertEqual(created["name"], "Тест-группа")
+
+        status, _, listing = self.json_request("GET", "/api/groups")
+        self.assertEqual(status, 200)
+        self.assertTrue(any(item["id"] == group_id for item in listing["items"]))
+
+        status, _, updated = self.json_request(
+            "PATCH", f"/api/groups/{group_id}", {"note": "обновлено"}
+        )
+        self.assertEqual(status, 200, updated)
+        self.assertEqual(updated["note"], "обновлено")
+
+        status, _, _ = self.json_request("DELETE", f"/api/groups/{group_id}")
+        self.assertEqual(status, 200)
+        status, _, _ = self.json_request("DELETE", f"/api/groups/{group_id}")
+        self.assertEqual(status, 404)
+
+    def test_group_assignment_to_user(self):
+        self.login()
+        status, _, group = self.json_request("POST", "/api/groups", {"name": "Клиенты API"})
+        self.assertEqual(status, 201, group)
+        status, _, user = self.json_request(
+            "POST", "/api/users", {"username": "grouped", "days": 5, "limit_gb": 1}
+        )
+        self.assertEqual(status, 201, user)
+        status, _, updated = self.json_request(
+            "PATCH", f"/api/users/{user['id']}", {"group_id": group["id"]}
+        )
+        self.assertEqual(status, 200, updated)
+        self.assertEqual(updated["group_id"], group["id"])
+        self.assertEqual(updated["group_name"], "Клиенты API")
+
+        status, _, listing = self.json_request("GET", f"/api/users?group_id={group['id']}")
+        self.assertEqual(status, 200)
+        self.assertTrue(all(item["group_id"] == group["id"] for item in listing["items"]))
+        self.json_request("DELETE", f"/api/users/{user['id']}")
+        self.json_request("DELETE", f"/api/groups/{group['id']}")
+
+    def test_outbounds_crud_and_config(self):
+        self.login()
+        status, _, created = self.json_request(
+            "POST",
+            "/api/outbounds",
+            {"name": "API SOCKS", "type": "socks", "address": "10.1.1.1", "port": 1080,
+             "username": "u", "password": "p"},
+        )
+        self.assertEqual(status, 201, created)
+        outbound_id = created["id"]
+        self.assertEqual(created["tag"], "api-socks")
+
+        nodes = self.json_request("GET", "/api/nodes")[2]["items"]
+        node_id = nodes[0]["id"]
+        status, _, config = self.json_request("GET", f"/api/nodes/{node_id}/config")
+        self.assertEqual(status, 200)
+        tags = [item["tag"] for item in config["outbounds"]]
+        self.assertIn("api-socks", tags)
+
+        status, _, updated = self.json_request(
+            "PATCH", f"/api/outbounds/{outbound_id}", {"enabled": False}
+        )
+        self.assertEqual(status, 200, updated)
+        self.assertFalse(updated["enabled"])
+        status, _, config = self.json_request("GET", f"/api/nodes/{node_id}/config")
+        tags = [item["tag"] for item in config["outbounds"]]
+        self.assertNotIn("api-socks", tags)
+
+        status, _, _ = self.json_request("DELETE", f"/api/outbounds/{outbound_id}")
+        self.assertEqual(status, 200)
+
+    def test_hosts_and_docs_endpoints(self):
+        self.login()
+        status, _, hosts = self.json_request("GET", "/api/hosts")
+        self.assertEqual(status, 200, hosts)
+        self.assertTrue(hosts["items"], "у демо-нод должны быть домены-маски")
+        self.assertIn("nodes_count", hosts["items"][0])
+
+        status, _, docs = self.json_request("GET", "/api/docs")
+        self.assertEqual(status, 200, docs)
+        paths = {(item["method"], item["path"]) for item in docs["items"]}
+        self.assertIn(("GET", "/api/groups"), paths)
+        self.assertIn(("POST", "/api/reality/scan"), paths)
+        self.assertIn(("GET", "/api/agent/config"), paths)
+
+    def test_reality_scan_api(self):
+        self.login()
+        status, _, job = self.json_request(
+            "POST", "/api/reality/scan", {"targets": "127.0.0.1:9", "timeout": 1}
+        )
+        self.assertEqual(status, 201, job)
+        self.assertIn("job_id", job)
+        status, _, state = self.json_request("GET", f"/api/reality/scan/{job['job_id']}")
+        self.assertEqual(status, 200, state)
+        self.assertGreaterEqual(state["total"], 1)
+        status, _, missing = self.json_request("GET", "/api/reality/scan/deadbeef")
+        self.assertEqual(status, 404)
+
+    def test_reality_apply_updates_node(self):
+        self.login()
+        nodes = self.json_request("GET", "/api/nodes")[2]["items"]
+        node_id = nodes[0]["id"]
+        status, _, updated = self.json_request(
+            "POST", "/api/reality/apply", {"node_id": node_id, "host": "www.example.org", "port": 443}
+        )
+        self.assertEqual(status, 200, updated)
+        self.assertEqual(updated["sni"], "www.example.org")
+        self.assertEqual(updated["dest"], "www.example.org:443")
+        status, _, bad = self.json_request(
+            "POST", "/api/reality/apply", {"node_id": node_id, "host": "не домен "}
+        )
+        self.assertEqual(status, 400)
+
+    def test_updates_check_with_mock(self):
+        self.login()
+        from app import updates
+
+        original = updates._fetch_latest
+
+        def fake_fetch():
+            return {
+                "latest": "9.9.9",
+                "notes": "Что нового",
+                "url": "https://example.com/release",
+                "published_at": "2026-01-01T00:00:00Z",
+                "source": "release",
+            }
+
+        updates._fetch_latest = fake_fetch
+        try:
+            status, _, data = self.json_request("POST", "/api/updates/check")
+        finally:
+            updates._fetch_latest = original
+        self.assertEqual(status, 200, data)
+        self.assertEqual(data["latest"], "9.9.9")
+        self.assertTrue(data["update_available"])
+        self.assertIn("capability", data)
+
+        status, _, info = self.json_request("GET", "/api/updates")
+        self.assertEqual(status, 200)
+        self.assertEqual(info["current"], config.APP_VERSION)
+
+    def test_updates_apply_rejected_without_capability(self):
+        self.login()
+        from app import updates
+
+        original = updates.capability
+        updates.capability = lambda: {"mode": "manual", "label": "Вручную", "command": "", "hint": ""}
+        try:
+            status, _, data = self.json_request("POST", "/api/updates/apply")
+        finally:
+            updates.capability = original
+        self.assertEqual(status, 400, data)
+        self.assertIn("dfxray update", data.get("error", ""))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

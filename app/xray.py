@@ -202,8 +202,79 @@ def _routing(settings: dict[str, str]) -> dict[str, Any]:
     return {"domainStrategy": "IPIfNonMatch", "rules": rules}
 
 
+
+# --------------------------------------------------------------------------
+# Исходящие (outbounds) из панели
+# --------------------------------------------------------------------------
+
+
+def outbound_configs(rows: Iterable[Any] | None) -> list[dict[str, Any]]:
+    """Превратить записи outbounds из БД в блоки конфига Xray."""
+    result: list[dict[str, Any]] = []
+    for row in rows or ():
+        data = dict(row)
+        if not to_bool(data.get("enabled", True)):
+            continue
+        kind = (data.get("type") or "direct").lower()
+        tag = (data.get("tag") or "out").strip() or "out"
+        address = (data.get("address") or "").strip()
+        port = to_int(data.get("port"))
+        if kind == "direct":
+            entry = {"tag": tag, "protocol": "freedom", "settings": {"domainStrategy": "UseIPv4v6"}}
+        elif kind == "block":
+            entry = {"tag": tag, "protocol": "blackhole", "settings": {}}
+        elif kind in ("socks", "http"):
+            server: dict[str, Any] = {"address": address or "127.0.0.1", "port": port or 1080}
+            if data.get("username"):
+                server["users"] = [
+                    {"user": data.get("username") or "", "pass": data.get("password") or ""}
+                ]
+            entry = {"tag": tag, "protocol": kind, "settings": {"servers": [server]}}
+        elif kind == "shadowsocks":
+            server = {
+                "address": address or "127.0.0.1",
+                "port": port or 8388,
+                "method": "aes-256-gcm",
+                "password": data.get("password") or "",
+            }
+            entry = {"tag": tag, "protocol": "shadowsocks", "settings": {"servers": [server]}}
+        elif kind == "trojan":
+            server = {
+                "address": address or "127.0.0.1",
+                "port": port or 443,
+                "password": data.get("password") or "",
+            }
+            if data.get("sni"):
+                server["sni"] = data["sni"]
+            entry = {"tag": tag, "protocol": "trojan", "settings": {"servers": [server]}}
+        else:
+            continue
+        result.append(entry)
+    return result
+
+
+def _merge_outbounds(defaults: list[dict[str, Any]], extra: list[dict[str, Any]],
+                     primary: str = "") -> list[dict[str, Any]]:
+    merged = list(defaults)
+    known = {item["tag"] for item in merged}
+    for item in extra:
+        if item["tag"] in known:
+            continue
+        merged.append(item)
+        known.add(item["tag"])
+    if primary:
+        for index, item in enumerate(merged):
+            if item["tag"] == primary and index:
+                merged.insert(0, merged.pop(index))
+                break
+    return merged
+
+
 def build_config(
-    node: Any, users: Iterable[Any], settings: dict[str, str] | None = None
+    node: Any,
+    users: Iterable[Any],
+    settings: dict[str, str] | None = None,
+    outbounds: Iterable[Any] | None = None,
 ) -> dict[str, Any]:
     settings = settings or {}
     dns_servers = DNS_PRESETS.get(settings.get("dns_preset", "cloudflare"), [])
@@ -215,10 +286,14 @@ def build_config(
         "log": {"loglevel": "warning", "access": "none"},
         "dns": dns,
         "inbounds": [api_inbound(), node_inbound(node, users)],
-        "outbounds": [
-            {"tag": "direct", "protocol": "freedom", "settings": {"domainStrategy": "UseIPv4v6"}},
-            {"tag": "block", "protocol": "blackhole", "settings": {}},
-        ],
+        "outbounds": _merge_outbounds(
+            [
+                {"tag": "direct", "protocol": "freedom", "settings": {"domainStrategy": "UseIPv4v6"}},
+                {"tag": "block", "protocol": "blackhole", "settings": {}},
+            ],
+            outbound_configs(outbounds),
+            (settings.get("route_default_outbound") or "").strip(),
+        ),
         "routing": _routing(settings),
         "stats": {},
         "policy": {

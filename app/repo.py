@@ -113,6 +113,9 @@ def serialize_user(
         "days_left": days_between(expires_at) if expires_at else None,
         "device_limit": to_int(data.get("device_limit")),
         "node_ids": node_ids,
+        "group_id": to_int(data.get("group_id")) or None,
+        "group_name": data.get("group_name") or "",
+        "group_color": data.get("group_color") or "",
         "status": user_status(data),
         "last_online_at": data.get("last_online_at") or "",
         "last_sub_at": data.get("last_sub_at") or "",
@@ -131,19 +134,26 @@ def list_users(
     limit: int = 200,
     offset: int = 0,
     base_url: str = "",
+    group_id: int = 0,
 ) -> tuple[list[dict[str, Any]], int]:
     where: list[str] = []
     params: list[Any] = []
+    if group_id:
+        where.append("u.group_id = ?")
+        params.append(group_id)
     if q:
         where.append(
-            "(lower(username) LIKE ? OR lower(coalesce(email,'')) LIKE ? "
-            "OR lower(coalesce(note,'')) LIKE ? OR uuid LIKE ?)"
+            "(lower(u.username) LIKE ? OR lower(coalesce(u.email,'')) LIKE ? "
+            "OR lower(coalesce(u.note,'')) LIKE ? OR u.uuid LIKE ?)"
         )
         pattern = f"%{q.strip().lower()}%"
         params += [pattern, pattern, pattern, f"%{q.strip()}%"]
     clause = f"WHERE {' AND '.join(where)}" if where else ""
     rows = db.all(
-        f"SELECT * FROM users {clause} ORDER BY id DESC", params
+        "SELECT u.*, g.name AS group_name, g.color AS group_color "
+        f"FROM users u LEFT JOIN groups g ON g.id = u.group_id {clause} "
+        "ORDER BY u.id DESC",
+        params,
     )
     items = [serialize_user(r, base_url) for r in rows]
     if status and status != "all":
@@ -166,7 +176,11 @@ def list_users(
 
 
 def get_user(user_id: int) -> sqlite3.Row | None:
-    return db.one("SELECT * FROM users WHERE id = ?", (user_id,))
+    return db.one(
+        "SELECT u.*, g.name AS group_name, g.color AS group_color "
+        "FROM users u LEFT JOIN groups g ON g.id = u.group_id WHERE u.id = ?",
+        (user_id,),
+    )
 
 
 def get_user_by_token(sub_token: str) -> sqlite3.Row | None:
@@ -201,11 +215,13 @@ def create_user(payload: dict[str, Any]) -> int:
     node_ids_text = ",".join(str(to_int(x)) for x in node_ids if to_int(x)) or None
     limit_bytes = gb_to_bytes(payload.get("limit_gb", 0))
     stamp = iso()
+    group_id = to_int(payload.get("group_id", 0)) or None
     return db.run(
         """INSERT INTO users(
             username, email, uuid, sub_token, flow, limit_bytes,
-            expires_at, enabled, note, device_limit, node_ids, created_at, updated_at
-        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            expires_at, enabled, note, device_limit, node_ids, group_id,
+            created_at, updated_at
+        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             username,
             (payload.get("email") or "").strip() or None,
@@ -218,6 +234,7 @@ def create_user(payload: dict[str, Any]) -> int:
             (payload.get("note") or "").strip() or None,
             to_int(payload.get("device_limit", 0)),
             node_ids_text,
+            group_id,
             stamp,
             stamp,
         ),
@@ -255,6 +272,8 @@ def update_user(user_id: int, payload: dict[str, Any]) -> None:
     if "days" in payload and payload["days"] not in (None, ""):
         days_int = to_int(payload["days"])
         fields["expires_at"] = today_str(days_int) if days_int > 0 else None
+    if "group_id" in payload:
+        fields["group_id"] = to_int(payload["group_id"]) or None
     if "enabled" in payload:
         fields["enabled"] = 1 if to_bool(payload["enabled"]) else 0
     if "node_ids" in payload:
@@ -642,3 +661,203 @@ def dashboard(base_url: str = "") -> dict[str, Any]:
         "audit": list_audit(8),
         "version": config.APP_VERSION,
     }
+
+
+# --------------------------------------------------------------------------
+# Группы клиентов
+# --------------------------------------------------------------------------
+
+GROUP_COLORS = (
+    "#7c5cff", "#4f8cff", "#3fb950", "#d29922", "#f85149", "#a371f7", "#2dd4bf",
+)
+
+
+def serialize_group(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+    data = dict(row)
+    used = to_int(data.get("used_bytes"))
+    return {
+        "id": data["id"],
+        "name": data["name"],
+        "color": data.get("color") or GROUP_COLORS[0],
+        "note": data.get("note") or "",
+        "users_count": to_int(data.get("users_count")),
+        "used_bytes": used,
+        "used_human": human_size(used),
+        "created_at": data.get("created_at") or "",
+    }
+
+
+def list_groups() -> list[dict[str, Any]]:
+    rows = db.all(
+        "SELECT g.*, COUNT(u.id) AS users_count, "
+        "COALESCE(SUM(u.up_bytes + u.down_bytes), 0) AS used_bytes "
+        "FROM groups g LEFT JOIN users u ON u.group_id = g.id "
+        "GROUP BY g.id ORDER BY g.name COLLATE NOCASE"
+    )
+    return [serialize_group(row) for row in rows]
+
+
+def get_group(group_id: int) -> sqlite3.Row | None:
+    return db.one("SELECT * FROM groups WHERE id = ?", (group_id,))
+
+
+def create_group(payload: dict[str, Any]) -> int:
+    name = (payload.get("name") or "").strip()
+    if not name:
+        raise ValueError("Укажите название группы")
+    if len(name) > 64:
+        raise ValueError("Название группы слишком длинное")
+    if db.one("SELECT 1 FROM groups WHERE lower(name) = lower(?)", (name,)):
+        raise ValueError("Группа с таким названием уже есть")
+    return db.run(
+        "INSERT INTO groups(name, color, note, created_at) VALUES(?,?,?,?)",
+        (
+            name,
+            (payload.get("color") or "").strip() or GROUP_COLORS[0],
+            (payload.get("note") or "").strip(),
+            iso(),
+        ),
+    )
+
+
+def update_group(group_id: int, payload: dict[str, Any]) -> None:
+    row = get_group(group_id)
+    if row is None:
+        raise ValueError("Группа не найдена")
+    fields: dict[str, Any] = {}
+    if "name" in payload:
+        name = (payload["name"] or "").strip()
+        if not name:
+            raise ValueError("Название группы не может быть пустым")
+        other = db.one(
+            "SELECT id FROM groups WHERE lower(name) = lower(?) AND id != ?",
+            (name, group_id),
+        )
+        if other:
+            raise ValueError("Группа с таким названием уже есть")
+        fields["name"] = name
+    if "color" in payload:
+        fields["color"] = (payload["color"] or "").strip() or GROUP_COLORS[0]
+    if "note" in payload:
+        fields["note"] = (payload["note"] or "").strip()
+    if not fields:
+        return
+    assignments = ", ".join(f"{key} = ?" for key in fields)
+    db.run(f"UPDATE groups SET {assignments} WHERE id = ?", (*fields.values(), group_id))
+
+
+def delete_group(group_id: int) -> None:
+    db.run("DELETE FROM groups WHERE id = ?", (group_id,))
+
+
+# --------------------------------------------------------------------------
+# Исходящие (outbounds)
+# --------------------------------------------------------------------------
+
+OUTBOUND_TYPES = ("direct", "block", "socks", "http", "wireguard", "shadowsocks", "trojan")
+
+
+def _slug_tag(name: str, fallback: str = "outbound") -> str:
+    letters = [ch.lower() if ch.isalnum() else "-" for ch in (name or "")]
+    slug = "".join(letters).strip("-")
+    while "--" in slug:
+        slug = slug.replace("--", "-")
+    return slug[:32] or fallback
+
+
+def serialize_outbound(row: sqlite3.Row | dict[str, Any], with_secrets: bool = False) -> dict[str, Any]:
+    data = dict(row)
+    password = data.get("password") or ""
+    return {
+        "id": data["id"],
+        "name": data["name"],
+        "tag": data.get("tag") or _slug_tag(data["name"]),
+        "type": data.get("type") or "direct",
+        "address": data.get("address") or "",
+        "port": to_int(data.get("port")),
+        "username": data.get("username") or "",
+        "password": password if with_secrets else ("•" * 8 if password else ""),
+        "sni": data.get("sni") or "",
+        "enabled": bool(to_int(data.get("enabled"))),
+        "sort": to_int(data.get("sort")),
+        "created_at": data.get("created_at") or "",
+        "updated_at": data.get("updated_at") or "",
+    }
+
+
+def list_outbounds(with_secrets: bool = False) -> list[dict[str, Any]]:
+    rows = db.all("SELECT * FROM outbounds ORDER BY sort, id")
+    return [serialize_outbound(row, with_secrets) for row in rows]
+
+
+def get_outbound(outbound_id: int) -> sqlite3.Row | None:
+    return db.one("SELECT * FROM outbounds WHERE id = ?", (outbound_id,))
+
+
+def create_outbound(payload: dict[str, Any]) -> int:
+    name = (payload.get("name") or "").strip()
+    if not name:
+        raise ValueError("Укажите название исходящего")
+    kind = (payload.get("type") or "direct").strip().lower()
+    if kind not in OUTBOUND_TYPES:
+        raise ValueError("Неизвестный тип исходящего")
+    stamp = iso()
+    return db.run(
+        "INSERT INTO outbounds(name, tag, type, address, port, username, password, sni, "
+        "enabled, sort, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            name,
+            (payload.get("tag") or "").strip() or _slug_tag(name),
+            kind,
+            (payload.get("address") or "").strip(),
+            to_int(payload.get("port")),
+            (payload.get("username") or "").strip(),
+            (payload.get("password") or "").strip(),
+            (payload.get("sni") or "").strip(),
+            1 if to_bool(payload.get("enabled", True)) else 0,
+            to_int(payload.get("sort", 100)),
+            stamp,
+            stamp,
+        ),
+    )
+
+
+def update_outbound(outbound_id: int, payload: dict[str, Any]) -> None:
+    row = get_outbound(outbound_id)
+    if row is None:
+        raise ValueError("Исходящий не найден")
+    fields: dict[str, Any] = {}
+    if "name" in payload:
+        name = (payload["name"] or "").strip()
+        if not name:
+            raise ValueError("Название не может быть пустым")
+        fields["name"] = name
+    if "tag" in payload:
+        fields["tag"] = (payload["tag"] or "").strip() or _slug_tag(
+            fields.get("name") or dict(row)["name"]
+        )
+    if "type" in payload:
+        kind = (payload["type"] or "").strip().lower()
+        if kind not in OUTBOUND_TYPES:
+            raise ValueError("Неизвестный тип исходящего")
+        fields["type"] = kind
+    for key in ("address", "username", "sni"):
+        if key in payload:
+            fields[key] = (payload[key] or "").strip()
+    if "password" in payload:
+        fields["password"] = (payload["password"] or "").strip()
+    if "port" in payload:
+        fields["port"] = to_int(payload["port"])
+    if "sort" in payload:
+        fields["sort"] = to_int(payload["sort"])
+    if "enabled" in payload:
+        fields["enabled"] = 1 if to_bool(payload["enabled"]) else 0
+    if not fields:
+        return
+    fields["updated_at"] = iso()
+    assignments = ", ".join(f"{key} = ?" for key in fields)
+    db.run(f"UPDATE outbounds SET {assignments} WHERE id = ?", (*fields.values(), outbound_id))
+
+
+def delete_outbound(outbound_id: int) -> None:
+    db.run("DELETE FROM outbounds WHERE id = ?", (outbound_id,))

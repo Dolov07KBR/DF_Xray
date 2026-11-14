@@ -14,7 +14,7 @@
 set -Eeuo pipefail
 
 APP_NAME="DF_Xray Panel"
-APP_VERSION="1.0.0"
+APP_VERSION="1.1.0"
 REPO="${DFX_REPO:-Dolov07KBR/DF_Xray}"
 DEFAULT_REF="${DFX_REF:-main}"
 INSTALL_DIR="${DFX_INSTALL_DIR:-/opt/dfxray}"
@@ -93,6 +93,7 @@ $APP_NAME $APP_VERSION — установка на VPS
       --admin-password <п> пароль администратора (по умолчанию сгенерируется)
   -y, --yes                не задавать вопросов
       --dry-run            показать план, ничего не менять
+      --no-self-update     не включать обновление панели из интерфейса
       --uninstall          удалить панель и контейнеры
   -h, --help               эта справка
   -V, --version            версия установщика
@@ -124,6 +125,7 @@ parse_args() {
             -y|--yes)         ASSUME_YES=1; shift ;;
             --dry-run)        DRY_RUN=1; shift ;;
             --uninstall)      UNINSTALL=1; shift ;;
+            --no-self-update) SELF_UPDATE=0; shift ;;
             -h|--help)        usage; exit 0 ;;
             -V|--version)     echo "$APP_NAME installer $APP_VERSION"; exit 0 ;;
             *) die "Неизвестный флаг: $1 (см. --help)" ;;
@@ -470,6 +472,7 @@ DFX_SEED_DEMO=$SEED_DEMO
 DFX_TRUST_PROXY=1
 
 # HTTPS через Caddy (профиль tls)
+SELF_UPDATE=${SELF_UPDATE:-1}
 COMPOSE_PROFILES=$compose_profiles
 PANEL_DOMAIN=$DOMAIN
 ACME_EMAIL=$ACME_EMAIL
@@ -514,7 +517,12 @@ write_caddyfile() {
 
 # ---------------------------------------------------------------- запуск ---
 compose() {
-    "${COMPOSE[@]}" --project-directory "$INSTALL_DIR" -f "$INSTALL_DIR/docker-compose.yml" "$@"
+    local files=(-f "$INSTALL_DIR/docker-compose.yml")
+    # Самообновление панели из интерфейса: код монтируется из каталога установки.
+    if [ "$SELF_UPDATE" = "1" ] && [ -f "$INSTALL_DIR/docker-compose.selfupdate.yml" ]; then
+        files+=(-f "$INSTALL_DIR/docker-compose.selfupdate.yml")
+    fi
+    "${COMPOSE[@]}" --project-directory "$INSTALL_DIR" "${files[@]}" "$@"
 }
 
 start_stack() {

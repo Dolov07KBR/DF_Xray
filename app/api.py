@@ -5,10 +5,12 @@ from __future__ import annotations
 import csv
 import io
 import json
+import re
 from typing import Any
 
-from . import auth, config, db, qr, repo, xray
+from . import auth, config, db, qr, reality, repo, updates, xray
 from .server import (
+    ROUTES,
     ApiError,
     Request,
     Response,
@@ -193,12 +195,20 @@ def users_index(req: Request) -> Response:
         limit=req.q_int("limit", 500),
         offset=req.q_int("offset", 0),
         base_url=base,
+        group_id=req.q_int("group_id", 0),
     )
     all_items, _ = repo.list_users(limit=100000, base_url=base)
     summary = {"total": len(all_items)}
     for status in ("active", "disabled", "expired", "limited"):
         summary[status] = sum(1 for u in all_items if u["status"] == status)
-    return json_response({"items": items, "total": total, "summary": summary})
+    return json_response(
+        {
+            "items": items,
+            "total": total,
+            "summary": summary,
+            "groups": repo.list_groups(),
+        }
+    )
 
 
 @post("/api/users")
@@ -308,6 +318,8 @@ def users_action(req: Request) -> Response:
         repo.extend_user(row["id"], days)
     elif action == "set_limit":
         repo.update_user(row["id"], {"limit_gb": payload.get("value", 0)})
+    elif action == "set_group":
+        repo.update_user(row["id"], {"group_id": payload.get("value", 0)})
     else:
         raise ApiError(400, "Неизвестное действие")
     updated = _user_or_404(row["id"])
@@ -402,7 +414,12 @@ def nodes_create(req: Request) -> Response:
 def nodes_show(req: Request) -> Response:
     row = _node_or_404(req.params["node_id"])
     data = repo.serialize_node(row, with_secrets=True)
-    data["config"] = xray.build_config(row, repo.node_traffic_users(row["id"]), db.get_settings())
+    data["config"] = xray.build_config(
+        row,
+        repo.node_traffic_users(row["id"]),
+        db.get_settings(),
+        repo.list_outbounds(with_secrets=True),
+    )
     data["users_count"] = len(repo.node_traffic_users(row["id"]))
     data["base_url"] = req.base_url()
     return json_response(data)
@@ -441,7 +458,9 @@ def nodes_probe(req: Request) -> Response:
 def nodes_config(req: Request) -> Response:
     row = _node_or_404(req.params["node_id"])
     users = repo.node_traffic_users(row["id"])
-    data = xray.build_config(row, users, db.get_settings())
+    data = xray.build_config(
+        row, users, db.get_settings(), repo.list_outbounds(with_secrets=True)
+    )
     body = json.dumps(data, ensure_ascii=False, indent=2)
     headers = {}
     if req.q("download") == "1":
@@ -546,6 +565,10 @@ SETTING_TYPES = {
     "default_device_limit": int,
     "traffic_retention_days": int,
     "footer_note": str,
+    "route_default_outbound": str,
+    "update_auto": bool,
+    "update_command": str,
+    "install_dir": str,
 }
 
 
@@ -657,7 +680,9 @@ def _config_revision(node_id: int, users) -> str:
 def agent_config(req: Request) -> Response:
     node = _agent_node(req)
     users = repo.node_traffic_users(node["id"])
-    config_data = xray.build_config(node, users, db.get_settings())
+    config_data = xray.build_config(
+        node, users, db.get_settings(), repo.list_outbounds(with_secrets=True)
+    )
     repo.touch_node(node["id"])
     return json_response(
         {
@@ -727,5 +752,313 @@ def agent_report(req: Request) -> Response:
             "revision": _config_revision(node["id"], users),
             "users": len(users),
             "poll_interval": config.AGENT_POLL_SECONDS,
+        }
+    )
+
+
+# --------------------------------------------------------------------------
+# Группы клиентов
+# --------------------------------------------------------------------------
+
+
+@get("/api/groups")
+def groups_index(req: Request) -> Response:
+    items = repo.list_groups()
+    return json_response({"items": items, "total": len(items)})
+
+
+@post("/api/groups")
+def groups_create(req: Request) -> Response:
+    try:
+        group_id = repo.create_group(req.json())
+    except ValueError as exc:
+        raise ApiError(400, str(exc)) from exc
+    _audit(req, "group.create", str(req.json().get("name") or ""), f"id={group_id}")
+    row = repo.get_group(group_id)
+    return json_response(repo.serialize_group(row), status=201)
+
+
+@patch(r"/api/groups/(?P<group_id>\d+)")
+def groups_update(req: Request) -> Response:
+    group_id = to_int(req.params["group_id"])
+    try:
+        repo.update_group(group_id, req.json())
+    except ValueError as exc:
+        raise ApiError(400, str(exc)) from exc
+    row = repo.get_group(group_id)
+    if row is None:
+        raise ApiError(404, "Группа не найдена")
+    _audit(req, "group.update", row["name"], f"id={group_id}")
+    return json_response(repo.serialize_group(row))
+
+
+@delete(r"/api/groups/(?P<group_id>\d+)")
+def groups_delete(req: Request) -> Response:
+    group_id = to_int(req.params["group_id"])
+    row = repo.get_group(group_id)
+    if row is None:
+        raise ApiError(404, "Группа не найдена")
+    repo.delete_group(group_id)
+    _audit(req, "group.delete", row["name"], f"id={group_id}")
+    return json_response({"ok": True})
+
+
+# --------------------------------------------------------------------------
+# Исходящие
+# --------------------------------------------------------------------------
+
+
+@get("/api/outbounds")
+def outbounds_index(req: Request) -> Response:
+    items = repo.list_outbounds(with_secrets=req.q("secrets") == "1")
+    return json_response(
+        {
+            "items": items,
+            "total": len(items),
+            "types": list(repo.OUTBOUND_TYPES),
+            "default": db.get_setting("route_default_outbound", ""),
+        }
+    )
+
+
+@post("/api/outbounds")
+def outbounds_create(req: Request) -> Response:
+    try:
+        outbound_id = repo.create_outbound(req.json())
+    except ValueError as exc:
+        raise ApiError(400, str(exc)) from exc
+    row = repo.get_outbound(outbound_id)
+    _audit(req, "outbound.create", row["name"] if row else "", f"id={outbound_id}")
+    return json_response(repo.serialize_outbound(row, with_secrets=True), status=201)
+
+
+@patch(r"/api/outbounds/(?P<outbound_id>\d+)")
+def outbounds_update(req: Request) -> Response:
+    outbound_id = to_int(req.params["outbound_id"])
+    try:
+        repo.update_outbound(outbound_id, req.json())
+    except ValueError as exc:
+        raise ApiError(400, str(exc)) from exc
+    row = repo.get_outbound(outbound_id)
+    if row is None:
+        raise ApiError(404, "Исходящий не найден")
+    _audit(req, "outbound.update", row["name"], f"id={outbound_id}")
+    return json_response(repo.serialize_outbound(row, with_secrets=True))
+
+
+@delete(r"/api/outbounds/(?P<outbound_id>\d+)")
+def outbounds_delete(req: Request) -> Response:
+    outbound_id = to_int(req.params["outbound_id"])
+    row = repo.get_outbound(outbound_id)
+    if row is None:
+        raise ApiError(404, "Исходящий не найден")
+    repo.delete_outbound(outbound_id)
+    _audit(req, "outbound.delete", row["name"], f"id={outbound_id}")
+    return json_response({"ok": True})
+
+
+# --------------------------------------------------------------------------
+# Хосты (домены масок из нод)
+# --------------------------------------------------------------------------
+
+
+def _split_host(value: str) -> str:
+    value = (value or "").strip()
+    if not value:
+        return ""
+    if value.startswith("["):  # IPv6
+        return value.split("]")[0].lstrip("[")
+    if value.count(":") == 1:
+        return value.split(":", 1)[0]
+    return value
+
+
+@get("/api/hosts")
+def hosts_index(req: Request) -> Response:
+    nodes = repo.list_nodes(with_secrets=True)
+    hosts: dict[str, dict[str, Any]] = {}
+    for node in nodes:
+        values = [node.get("sni") or "", _split_host(node.get("dest") or "")]
+        for host in dict.fromkeys(v.strip() for v in values if v and v.strip()):
+            entry = hosts.setdefault(
+                host,
+                {
+                    "host": host,
+                    "nodes": [],
+                    "protocols": [],
+                    "securities": [],
+                    "ports": [],
+                    "reality": False,
+                },
+            )
+            entry["nodes"].append({"id": node["id"], "name": node["name"]})
+            if node.get("protocol") not in entry["protocols"]:
+                entry["protocols"].append(node.get("protocol"))
+            if node.get("security") not in entry["securities"]:
+                entry["securities"].append(node.get("security"))
+            if node.get("port") not in entry["ports"]:
+                entry["ports"].append(node.get("port"))
+            if node.get("security") == "reality":
+                entry["reality"] = True
+    items = sorted(hosts.values(), key=lambda item: item["host"].lower())
+    for item in items:
+        item["nodes_count"] = len(item["nodes"])
+    return json_response({"items": items, "total": len(items)})
+
+
+# --------------------------------------------------------------------------
+# Сканер целей REALITY
+# --------------------------------------------------------------------------
+
+
+@get("/api/reality/presets", auth_required=False)
+def reality_presets(req: Request) -> Response:
+    return json_response(
+        {
+            "presets": list(reality.DEFAULT_TARGETS),
+            "port": reality.DEFAULT_PORT,
+            "max_targets": reality.MAX_TARGETS,
+        }
+    )
+
+
+@post("/api/reality/scan")
+def reality_scan(req: Request) -> Response:
+    payload = req.json()
+    raw = str(payload.get("targets") or "").strip()
+    port = to_int(payload.get("port", 443)) or 443
+    if not 1 <= port <= 65535:
+        raise ApiError(400, "Некорректный порт")
+    timeout = payload.get("timeout", reality.DEFAULT_TIMEOUT)
+    try:
+        timeout_value = float(timeout)
+    except (TypeError, ValueError):
+        timeout_value = reality.DEFAULT_TIMEOUT
+    timeout_value = min(max(timeout_value, 1.0), 15.0)
+    workers = to_int(payload.get("workers", reality.DEFAULT_WORKERS))
+    try:
+        job = reality.MANAGER.start(raw, port=port, timeout=timeout_value, workers=workers)
+    except ValueError as exc:
+        raise ApiError(400, str(exc)) from exc
+    _audit(req, "reality.scan", str(len(job.targets)), f"job={job.id}")
+    return json_response(
+        {
+            "job_id": job.id,
+            "total": len(job.targets),
+            "targets": [target.label for target in job.targets[:64]],
+        },
+        status=201,
+    )
+
+
+@get(r"/api/reality/scan/(?P<job_id>[A-Za-z0-9]+)")
+def reality_scan_status(req: Request) -> Response:
+    job = reality.MANAGER.get(req.params["job_id"])
+    if job is None:
+        raise ApiError(404, "Задание сканирования не найдено")
+    snapshot = job.snapshot()
+    counts = {"ok": 0, "weak": 0, "fail": 0}
+    for item in snapshot["results"]:
+        status = str(item.get("status") or "fail")
+        counts[status] = counts.get(status, 0) + 1
+    snapshot["counts"] = counts
+    return json_response(snapshot)
+
+
+@post(r"/api/reality/scan/(?P<job_id>[A-Za-z0-9]+)/cancel")
+def reality_scan_cancel(req: Request) -> Response:
+    ok = reality.MANAGER.cancel(req.params["job_id"])
+    if not ok:
+        raise ApiError(404, "Задание сканирования не найдено")
+    return json_response({"ok": True})
+
+
+@post("/api/reality/apply")
+def reality_apply(req: Request) -> Response:
+    payload = req.json()
+    node = _node_or_404(payload.get("node_id", 0))
+    try:
+        host = reality.validate_target(str(payload.get("host") or ""))
+    except ValueError as exc:
+        raise ApiError(400, str(exc)) from exc
+    port = to_int(payload.get("port", 443)) or 443
+    if not 1 <= port <= 65535:
+        raise ApiError(400, "Некорректный порт")
+    repo.update_node(node["id"], {"sni": host, "dest": f"{host}:{port}"})
+    updated = _node_or_404(node["id"])
+    _audit(req, "node.reality_target", updated["name"], f"{host}:{port}")
+    return json_response(repo.serialize_node(updated, with_secrets=True))
+
+
+# --------------------------------------------------------------------------
+# Обновления панели
+# --------------------------------------------------------------------------
+
+
+@get("/api/updates")
+def updates_info(req: Request) -> Response:
+    payload = updates.check(force=False)
+    payload["capability"] = updates.capability()
+    payload["status"] = updates.status()
+    return json_response(payload)
+
+
+@post("/api/updates/check")
+def updates_check(req: Request) -> Response:
+    payload = updates.check(force=True)
+    payload["capability"] = updates.capability()
+    payload["status"] = updates.status()
+    _audit(req, "updates.check", str(payload.get("latest") or ""))
+    return json_response(payload)
+
+
+@post("/api/updates/apply")
+def updates_apply(req: Request) -> Response:
+    try:
+        result = updates.start_update()
+    except RuntimeError as exc:
+        raise ApiError(400, str(exc)) from exc
+    _audit(req, "updates.apply", result.get("command", ""))
+    return json_response(result, status=202)
+
+
+@get("/api/updates/status")
+def updates_status(req: Request) -> Response:
+    return json_response(updates.status())
+
+
+# --------------------------------------------------------------------------
+# Документация API
+# --------------------------------------------------------------------------
+
+
+@get("/api/docs")
+def api_docs(req: Request) -> Response:
+    items: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for item in ROUTES:
+        pattern = item.regex.pattern
+        if not pattern.startswith("^/api/"):
+            continue
+        sample = re.sub(r"\(\?P<(\w+)>[^)]+\)", r"{\1}", pattern[1:-1])
+        key = (item.method, sample)
+        if key in seen:
+            continue
+        seen.add(key)
+        items.append(
+            {
+                "method": item.method,
+                "path": sample,
+                "auth": item.auth_required,
+                "agent": sample.startswith("/api/agent/"),
+            }
+        )
+    items.sort(key=lambda entry: (entry["path"], entry["method"]))
+    return json_response(
+        {
+            "items": items,
+            "total": len(items),
+            "version": config.API_VERSION,
+            "base": req.base_url(),
         }
     )
