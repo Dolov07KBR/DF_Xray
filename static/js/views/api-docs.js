@@ -7,7 +7,7 @@ const METHOD_CLASS = {
 };
 
 function groupOf(path) {
-  if (path.startsWith('/api/agent/')) return 'Агент ноды';
+  if (path.startsWith('/api/agent/') || path.startsWith('/api/node/')) return 'Агент и установка';
   if (path.startsWith('/api/auth/') || path.startsWith('/api/account/')) return 'Сессии и аккаунт';
   if (path.startsWith('/api/users')) return 'Клиенты';
   if (path.startsWith('/api/groups')) return 'Группы';
@@ -44,7 +44,7 @@ export async function render(container, ctx) {
   const ORDER = [
     'Дашборд', 'Клиенты', 'Группы', 'Узлы', 'Сканер Reality', 'Исходящие',
     'Маршрутизация', 'Подписки', 'Настройки', 'Обновления', 'Обслуживание',
-    'Журнал', 'Агент ноды', 'Сессии и аккаунт', 'Документация', 'Прочее',
+    'Журнал', 'Агент и установка', 'Сессии и аккаунт', 'Документация', 'Прочее',
   ];
   const groups = new Map();
   items.forEach((item) => {

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
 import sqlite3
 from typing import Any
@@ -40,6 +41,7 @@ USER_FIELDS = (
 NODE_FIELDS = (
     "name",
     "address",
+    "region",
     "port",
     "protocol",
     "cert_file",
@@ -364,12 +366,26 @@ def node_status(row: sqlite3.Row | dict[str, Any]) -> str:
     return "offline"
 
 
+def node_health(row: sqlite3.Row | dict[str, Any]) -> str:
+    """Здоровье ноды: offline / degraded (Xray не работает) / ok."""
+    data = dict(row)
+    if not to_int(data.get("enabled")):
+        return "disabled"
+    status = node_status(data)
+    if status != "online":
+        return "offline" if status == "offline" else "unknown"
+    if data.get("xray_running") is not None and not to_int(data.get("xray_running")):
+        return "degraded"
+    return "ok"
+
+
 def serialize_node(row: sqlite3.Row | dict[str, Any], with_secrets: bool = False) -> dict[str, Any]:
     data = dict(row)
     node = {
         "id": data["id"],
         "name": data["name"],
         "address": data["address"],
+        "region": data.get("region") or "",
         "port": to_int(data["port"]),
         "protocol": data.get("protocol") or "vless",
         "transport": data.get("transport") or "tcp",
@@ -387,17 +403,28 @@ def serialize_node(row: sqlite3.Row | dict[str, Any], with_secrets: bool = False
         "alpn": data.get("alpn") or "",
         "enabled": bool(to_int(data.get("enabled"))),
         "status": node_status(data),
+        "health": node_health(data),
         "last_seen": data.get("last_seen") or "",
         "xray_version": data.get("xray_version") or "",
         "up_bytes": to_int(data.get("up_bytes")),
         "down_bytes": to_int(data.get("down_bytes")),
         "note": data.get("note") or "",
         "sort": to_int(data.get("sort")),
+        "agent_version": data.get("agent_version") or "",
+        "xray_running": None if data.get("xray_running") is None else bool(to_int(data.get("xray_running"))),
+        "uptime_seconds": to_int(data.get("uptime_seconds")),
+        "load1": float(data.get("load1") or 0),
+        "mem_used": to_int(data.get("mem_used")),
+        "mem_total": to_int(data.get("mem_total")),
+        "cfg_revision": data.get("cfg_revision") or "",
+        "applied_at": data.get("applied_at") or "",
+        "last_error": data.get("last_error") or "",
         "created_at": data.get("created_at") or "",
     }
     if with_secrets:
         node["private_key"] = data.get("private_key") or ""
         node["agent_token"] = data.get("agent_token") or ""
+        node["install_token"] = data.get("install_token") or ""
     return node
 
 
@@ -412,6 +439,26 @@ def get_node(node_id: int) -> sqlite3.Row | None:
 
 def get_node_by_token(agent_token: str) -> sqlite3.Row | None:
     return db.one("SELECT * FROM nodes WHERE agent_token = ?", ((agent_token or "").strip(),))
+
+
+def node_install_token(node_id: int, rotate: bool = False) -> str:
+    """Токен для скрипта установки ноды (не равен токену агента)."""
+    row = get_node(node_id)
+    if row is None:
+        raise ValueError("Нода не найдена")
+    existing = (row["install_token"] or "").strip()
+    if existing and not rotate:
+        return existing
+    value = token(24)
+    db.run("UPDATE nodes SET install_token = ? WHERE id = ?", (value, node_id))
+    return value
+
+
+def get_node_by_install_token(install_token: str) -> sqlite3.Row | None:
+    value = (install_token or "").strip()
+    if not value:
+        return None
+    return db.one("SELECT * FROM nodes WHERE install_token = ?", (value,))
 
 
 def create_node(payload: dict[str, Any]) -> int:
@@ -433,13 +480,14 @@ def create_node(payload: dict[str, Any]) -> int:
     stamp = iso()
     node_id = db.run(
         """INSERT INTO nodes(
-            name, address, port, protocol, transport, security, sni, fingerprint,
+            name, address, region, port, protocol, transport, security, sni, fingerprint,
             private_key, public_key, short_id, dest, path, service_name, flow,
             alpn, cert_file, key_file, enabled, note, sort, agent_token, created_at, updated_at
-        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             name,
             address,
+            (payload.get("region") or "").strip() or None,
             to_int(payload.get("port"), 443),
             protocol,
             transport,
@@ -505,9 +553,67 @@ def update_node(node_id: int, payload: dict[str, Any]) -> None:
     db.run(f"UPDATE nodes SET {assignments} WHERE id = ?", (*fields.values(), node_id))
 
 
+def traffic_by_node(days: int = 14) -> list[dict[str, Any]]:
+    """Трафик по нодам за период (для дашборда мультисерверной панели)."""
+    rows = db.all(
+        "SELECT node_id, SUM(up + down) AS total FROM traffic WHERE day >= ? GROUP BY node_id",
+        (today_str(-(max(1, days) - 1)),),
+    )
+    totals = {to_int(row["node_id"]): to_int(row["total"]) for row in rows}
+    result = []
+    for node in list_nodes():
+        result.append(
+            {
+                "id": node["id"],
+                "name": node["name"],
+                "status": node["status"],
+                "health": node["health"],
+                "total": totals.get(node["id"], 0),
+                "users_count": len(node_traffic_users(node["id"])),
+            }
+        )
+    result.sort(key=lambda item: item["total"], reverse=True)
+    return result
+
+
 def delete_node(node_id: int) -> None:
     db.run("DELETE FROM nodes WHERE id = ?", (node_id,))
     db.run("DELETE FROM traffic WHERE node_id = ?", (node_id,))
+
+
+def update_node_metrics(node_id: int, payload: dict[str, Any]) -> None:
+    """Принять heartbeat агента: версии, состояние Xray, железо, ревизия конфига."""
+    fields: dict[str, Any] = {"last_seen": iso(), "status": "online"}
+
+    version = (payload.get("xray_version") or "").strip()[:40]
+    if version:
+        fields["xray_version"] = version
+    agent_version = (payload.get("agent_version") or "").strip()[:40]
+    if agent_version:
+        fields["agent_version"] = agent_version
+    if "xray_running" in payload:
+        fields["xray_running"] = 1 if to_bool(payload.get("xray_running")) else 0
+    if "uptime" in payload:
+        fields["uptime_seconds"] = to_int(payload.get("uptime"))
+    if "load1" in payload:
+        with contextlib.suppress(TypeError, ValueError):
+            fields["load1"] = max(0.0, float(payload.get("load1") or 0))
+    memory = payload.get("memory") or {}
+    if isinstance(memory, dict):
+        if memory.get("used") is not None:
+            fields["mem_used"] = max(0, to_int(memory.get("used")))
+        if memory.get("total") is not None:
+            fields["mem_total"] = max(0, to_int(memory.get("total")))
+    revision = (payload.get("revision") or "").strip()[:40]
+    if revision:
+        fields["cfg_revision"] = revision
+        fields["applied_at"] = iso()
+    error = (payload.get("last_error") or "").strip()[:400]
+    if "last_error" in payload:
+        fields["last_error"] = error or None
+
+    assignments = ", ".join(f"{key} = ?" for key in fields)
+    db.run(f"UPDATE nodes SET {assignments} WHERE id = ?", (*fields.values(), node_id))
 
 
 def touch_node(node_id: int, version: str | None = None) -> None:
@@ -647,7 +753,14 @@ def dashboard(base_url: str = "") -> dict[str, Any]:
     )
     return {
         "counts": counts,
-        "nodes": {"total": len(nodes), "online": nodes_online, "items": nodes},
+        "nodes": {
+            "total": len(nodes),
+            "online": nodes_online,
+            "offline": sum(1 for n in nodes if n["health"] == "offline"),
+            "degraded": sum(1 for n in nodes if n["health"] == "degraded"),
+            "items": nodes,
+            "traffic": traffic_by_node(14),
+        },
         "traffic": {
             "up": totals["up"],
             "down": totals["down"],

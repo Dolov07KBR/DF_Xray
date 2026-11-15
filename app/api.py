@@ -8,7 +8,7 @@ import json
 import re
 from typing import Any
 
-from . import auth, config, db, qr, reality, repo, updates, xray
+from . import auth, config, db, nodeinstall, qr, reality, repo, updates, xray
 from .server import (
     ROUTES,
     ApiError,
@@ -383,12 +383,16 @@ def nodes_index(req: Request) -> Response:
         node["users_count"] = len(repo.node_traffic_users(node["id"]))
     total_up = sum(n["up_bytes"] for n in nodes)
     total_down = sum(n["down_bytes"] for n in nodes)
+    down = sum(1 for n in nodes if n["health"] == "offline")
+    degraded = sum(1 for n in nodes if n["health"] == "degraded")
     return json_response(
         {
             "items": nodes,
             "summary": {
                 "total": len(nodes),
                 "online": sum(1 for n in nodes if n["status"] == "online"),
+                "offline": down,
+                "degraded": degraded,
                 "up_bytes": total_up,
                 "down_bytes": total_down,
             },
@@ -422,6 +426,8 @@ def nodes_show(req: Request) -> Response:
     )
     data["users_count"] = len(repo.node_traffic_users(row["id"]))
     data["base_url"] = req.base_url()
+    data["config_revision"] = _config_revision(row["id"], repo.node_traffic_users(row["id"]))
+    data["installed"] = bool((row["last_seen"] or "").strip())
     return json_response(data)
 
 
@@ -443,6 +449,37 @@ def nodes_delete(req: Request) -> Response:
     repo.delete_node(row["id"])
     _audit(req, "node.delete", row["name"], f"id={row['id']}")
     return json_response({"ok": True})
+
+
+@get(r"/api/nodes/(?P<node_id>\d+)/connect")
+def nodes_connect(req: Request) -> Response:
+    """Команда установки ноды на новом сервере."""
+    row = _node_or_404(req.params["node_id"])
+    install_token = repo.node_install_token(row["id"])
+    payload = nodeinstall.connect_payload(
+        repo.serialize_node(row, with_secrets=True), req.base_url(), install_token
+    )
+    payload["node"] = {
+        "id": row["id"],
+        "name": row["name"],
+        "port": to_int(row["port"]),
+        "transport": row["transport"],
+        "security": row["security"],
+    }
+    return json_response(payload)
+
+
+@post(r"/api/nodes/(?P<node_id>\d+)/install-token")
+def nodes_install_token(req: Request) -> Response:
+    """Перевыпуск токена установки: старые команды перестают работать."""
+    row = _node_or_404(req.params["node_id"])
+    value = repo.node_install_token(row["id"], rotate=True)
+    _audit(req, "node.rotate_install_token", row["name"], f"id={row['id']}")
+    return json_response(
+        nodeinstall.connect_payload(
+            repo.serialize_node(row, with_secrets=True), req.base_url(), value
+        )
+    )
 
 
 @post(r"/api/nodes/(?P<node_id>\d+)/probe")
@@ -707,8 +744,7 @@ def agent_config(req: Request) -> Response:
 def agent_heartbeat(req: Request) -> Response:
     node = _agent_node(req)
     payload = req.json()
-    version = (payload.get("xray_version") or "").strip()[:40]
-    repo.touch_node(node["id"], version or None)
+    repo.update_node_metrics(node["id"], payload)
     return json_response({"ok": True, "ts": iso(), "poll_interval": config.AGENT_POLL_SECONDS})
 
 
@@ -742,7 +778,7 @@ def agent_report(req: Request) -> Response:
             "UPDATE nodes SET up_bytes = up_bytes + ?, down_bytes = down_bytes + ? WHERE id = ?",
             (node_up, node_down, node["id"]),
         )
-    repo.touch_node(node["id"], (payload.get("xray_version") or "").strip()[:40] or None)
+    repo.update_node_metrics(node["id"], payload)
     users = repo.node_traffic_users(node["id"])
     return json_response(
         {
@@ -753,6 +789,48 @@ def agent_report(req: Request) -> Response:
             "users": len(users),
             "poll_interval": config.AGENT_POLL_SECONDS,
         }
+    )
+
+
+# --------------------------------------------------------------------------
+# Установка ноды (публичные файлы по токену установки)
+# --------------------------------------------------------------------------
+
+
+@get(r"/api/node/install/(?P<install_token>[A-Za-z0-9_\-]+)\.sh", auth_required=False)
+def node_install_script(req: Request) -> Response:
+    row = repo.get_node_by_install_token(req.params["install_token"])
+    if row is None:
+        raise ApiError(404, "Ссылка установки устарела — перевыпустите её в панели")
+    script = nodeinstall.install_script(
+        url=req.base_url(),
+        node_token=row["agent_token"],
+        node_name=row["name"],
+        port=to_int(row["port"], 443),
+        agent_url=f"{req.base_url()}/api/node/agent.py",
+    )
+    return Response(
+        script,
+        content_type="text/x-shellscript; charset=utf-8",
+        headers={
+            "Cache-Control": "no-store",
+            "Content-Disposition": f'inline; filename="dfxray-node-{row["id"]}.sh"',
+        },
+    )
+
+
+@get("/api/node/agent.py", auth_required=False)
+def node_agent_source(req: Request) -> Response:
+    path = config.ROOT_DIR / "node" / "agent.py"
+    if not path.is_file():
+        raise ApiError(404, "Файл агента не найден")
+    return Response(
+        path.read_bytes(),
+        content_type="application/octet-stream",
+        headers={
+            "Cache-Control": "no-store",
+            "Content-Disposition": 'attachment; filename="dfxray-agent.py"',
+        },
     )
 
 
@@ -1040,7 +1118,7 @@ def api_docs(req: Request) -> Response:
         pattern = item.regex.pattern
         if not pattern.startswith("^/api/"):
             continue
-        sample = re.sub(r"\(\?P<(\w+)>[^)]+\)", r"{\1}", pattern[1:-1])
+        sample = re.sub(r"\(\?P<(\w+)>[^)]+\)", r"{\1}", pattern[1:-1]).replace("\\.", ".")
         key = (item.method, sample)
         if key in seen:
             continue

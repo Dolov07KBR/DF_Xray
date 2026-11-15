@@ -10,7 +10,7 @@ from typing import Any
 
 from . import config
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS settings (
@@ -40,6 +40,7 @@ CREATE TABLE IF NOT EXISTS nodes (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     name          TEXT NOT NULL,
     address       TEXT NOT NULL,
+    region        TEXT,
     port          INTEGER NOT NULL DEFAULT 443,
     protocol      TEXT NOT NULL DEFAULT 'vless',
     transport     TEXT NOT NULL DEFAULT 'tcp',
@@ -65,6 +66,16 @@ CREATE TABLE IF NOT EXISTS nodes (
     note          TEXT,
     sort          INTEGER NOT NULL DEFAULT 0,
     agent_token   TEXT NOT NULL,
+    install_token TEXT,
+    agent_version TEXT,
+    xray_running  INTEGER,
+    uptime_seconds INTEGER NOT NULL DEFAULT 0,
+    load1         REAL NOT NULL DEFAULT 0,
+    mem_used      INTEGER NOT NULL DEFAULT 0,
+    mem_total     INTEGER NOT NULL DEFAULT 0,
+    cfg_revision  TEXT,
+    applied_at    TEXT,
+    last_error    TEXT,
     created_at    TEXT NOT NULL,
     updated_at    TEXT NOT NULL
 );
@@ -278,6 +289,35 @@ def _migrate(conn: sqlite3.Connection) -> None:
             "ALTER TABLE users ADD COLUMN group_id INTEGER "
             "REFERENCES groups(id) ON DELETE SET NULL"
         )
+
+    # v3: метрики агента и токен установки для мультисерверной панели.
+    node_columns = {row["name"] for row in conn.execute("PRAGMA table_info(nodes)")}
+    additions = {
+        "region": "TEXT",
+        "install_token": "TEXT",
+        "agent_version": "TEXT",
+        "xray_running": "INTEGER",
+        "uptime_seconds": "INTEGER NOT NULL DEFAULT 0",
+        "load1": "REAL NOT NULL DEFAULT 0",
+        "mem_used": "INTEGER NOT NULL DEFAULT 0",
+        "mem_total": "INTEGER NOT NULL DEFAULT 0",
+        "cfg_revision": "TEXT",
+        "applied_at": "TEXT",
+        "last_error": "TEXT",
+    }
+    for name, ddl in additions.items():
+        if name not in node_columns:
+            conn.execute(f"ALTER TABLE nodes ADD COLUMN {name} {ddl}")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_nodes_install_token ON nodes(install_token)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_traffic_node ON traffic(node_id, day)")
+    if "install_token" not in node_columns:
+        import secrets
+
+        for row in conn.execute("SELECT id FROM nodes WHERE install_token IS NULL").fetchall():
+            conn.execute(
+                "UPDATE nodes SET install_token = ? WHERE id = ?",
+                (secrets.token_urlsafe(16), row["id"]),
+            )
 
 
 def init() -> None:

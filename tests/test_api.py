@@ -419,6 +419,10 @@ class PanelTestCase(unittest.TestCase):
         self.assertIn(("GET", "/api/groups"), paths)
         self.assertIn(("POST", "/api/reality/scan"), paths)
         self.assertIn(("GET", "/api/agent/config"), paths)
+        self.assertIn(("GET", "/api/node/agent.py"), paths)
+        install_paths = [path for method, path in paths if path.startswith("/api/node/install/")]
+        self.assertTrue(install_paths, "в документации есть ссылка установки")
+        self.assertTrue(install_paths[0].endswith(".sh"))
 
     def test_reality_scan_api(self):
         self.login()
@@ -489,6 +493,140 @@ class PanelTestCase(unittest.TestCase):
             updates.capability = original
         self.assertEqual(status, 400, data)
         self.assertIn("dfxray update", data.get("error", ""))
+
+    # --- мультисервер ---
+
+    def test_node_connect_and_install_script(self):
+        self.login()
+        nodes = self.json_request("GET", "/api/nodes")[2]["items"]
+        node_id = nodes[0]["id"]
+        status, _, data = self.json_request("GET", f"/api/nodes/{node_id}/connect")
+        self.assertEqual(status, 200, data)
+        self.assertIn("/api/node/install/", data["one_liner"])
+        self.assertIn("sudo bash", data["one_liner"])
+        self.assertTrue(data["install_token"])
+        self.assertIn("docker run", data["docker"])
+
+        # скрипт доступен без авторизации по токену установки
+        status, headers, body = self.request("GET", f"/api/node/install/{data['install_token']}.sh")
+        self.assertEqual(status, 200)
+        text = body.decode("utf-8")
+        self.assertIn("dfxray-node.service", text)
+        self.assertIn(data["node_token"], text)
+        self.assertIn("DFX_PANEL_URL", text)
+        self.assertIn("set -euo pipefail", text)
+
+        # перевыпуск ссылки: старая перестаёт работать
+        status, _, fresh = self.json_request(
+            "POST", f"/api/nodes/{node_id}/install-token"
+        )
+        self.assertEqual(status, 200, fresh)
+        self.assertNotEqual(fresh["install_token"], data["install_token"])
+        status, _, _ = self.request("GET", f"/api/node/install/{data['install_token']}.sh")
+        self.assertEqual(status, 404)
+        status, _, _ = self.request("GET", f"/api/node/install/{fresh['install_token']}.sh")
+        self.assertEqual(status, 200)
+
+    def test_agent_source_is_public(self):
+        status, headers, body = self.request("GET", "/api/node/agent.py")
+        self.assertEqual(status, 200)
+        self.assertIn("DF_Xray Node Agent", body.decode("utf-8"))
+
+    def test_agent_heartbeat_metrics(self):
+        self.login()
+        nodes = self.json_request("GET", "/api/nodes")[2]["items"]
+        node_id = nodes[0]["id"]
+        node = self.json_request("GET", f"/api/nodes/{node_id}")[2]
+        status, _, _ = self.json_request(
+            "POST",
+            "/api/agent/heartbeat",
+            {
+                "token": node["agent_token"],
+                "xray_version": "Xray 25.9.11",
+                "agent_version": "1.1.0",
+                "xray_running": True,
+                "uptime": 7200,
+                "load1": 0.42,
+                "memory": {"used": 512 * 1024 * 1024, "total": 2 * 1024 * 1024 * 1024},
+                "revision": "rev-abc",
+                "last_error": "",
+            },
+            headers={"X-Node-Token": node["agent_token"]},
+        )
+        self.assertEqual(status, 200)
+        fresh = self.json_request("GET", f"/api/nodes/{node_id}")[2]
+        self.assertEqual(fresh["status"], "online")
+        self.assertEqual(fresh["health"], "ok")
+        self.assertEqual(fresh["agent_version"], "1.1.0")
+        self.assertTrue(fresh["xray_running"])
+        self.assertEqual(fresh["uptime_seconds"], 7200)
+        self.assertAlmostEqual(fresh["load1"], 0.42)
+        self.assertEqual(fresh["mem_used"], 512 * 1024 * 1024)
+        self.assertEqual(fresh["cfg_revision"], "rev-abc")
+
+        status, _, _ = self.json_request(
+            "POST",
+            "/api/agent/heartbeat",
+            {"token": node["agent_token"], "xray_running": False,
+             "last_error": "xray -test: failed"},
+            headers={"X-Node-Token": node["agent_token"]},
+        )
+        self.assertEqual(status, 200)
+        fresh = self.json_request("GET", f"/api/nodes/{node_id}")[2]
+        self.assertEqual(fresh["health"], "degraded")
+        self.assertIn("failed", fresh["last_error"])
+
+        # возвращаем ноду в норму, чтобы не влиять на другие тесты
+        self.json_request(
+            "POST",
+            "/api/agent/heartbeat",
+            {"token": node["agent_token"], "xray_running": True, "last_error": ""},
+            headers={"X-Node-Token": node["agent_token"]},
+        )
+
+    def test_node_metrics_and_dashboard_traffic(self):
+        self.login()
+        nodes = self.json_request("GET", "/api/nodes")[2]["items"]
+        node_id = nodes[0]["id"]
+        node = self.json_request("GET", f"/api/nodes/{node_id}")[2]
+        self.json_request(
+            "POST",
+            "/api/agent/report",
+            {
+                "token": node["agent_token"],
+                "stats": {"users": {}, "node": {"up": 4096, "down": 8192}},
+                "xray_running": True,
+                "load1": 0.2,
+            },
+            headers={"X-Node-Token": node["agent_token"]},
+        )
+        _, _, dashboard = self.json_request("GET", "/api/dashboard")
+        entry = next(item for item in dashboard["nodes"]["traffic"] if item["id"] == node_id)
+        self.assertGreaterEqual(entry["total"], 12288)
+        self.assertIn("health", entry)
+
+        _, _, listing = self.json_request("GET", "/api/nodes")
+        self.assertIn("offline", listing["summary"])
+        self.assertIn("degraded", listing["summary"])
+        self.assertIn("region", listing["items"][0])
+
+    def test_node_crud_with_region(self):
+        self.login()
+        status, _, created = self.json_request(
+            "POST", "/api/nodes",
+            {"name": "Тестовый сервер", "address": "test.example.com", "region": "Финляндия",
+             "port": 8443, "security": "none", "protocol": "vless", "transport": "tcp"},
+        )
+        self.assertEqual(status, 201, created)
+        self.assertEqual(created["region"], "Финляндия")
+        status, _, updated = self.json_request(
+            "PATCH", f"/api/nodes/{created['id']}", {"region": "Швеция", "enabled": False}
+        )
+        self.assertEqual(status, 200, updated)
+        self.assertEqual(updated["region"], "Швеция")
+        self.assertFalse(updated["enabled"])
+        self.assertEqual(updated["health"], "disabled")
+        self.json_request("DELETE", f"/api/nodes/{created['id']}")
 
 
 if __name__ == "__main__":

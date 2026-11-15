@@ -46,12 +46,23 @@ export async function render(container, { setActions, navigate }) {
   const activeShare = counts.total ? Math.round((counts.active / counts.total) * 100) : 0;
   const expiring = data.expiring || [];
 
-  const banner = state.bootstrapPassword
-    ? `<div class="banner">${icon('alert')}
-        <div><b>Пароль администратора по умолчанию.</b>
-        Смените его в разделе <a href="#/settings">Настройки → Безопасность</a>, чтобы закрыть панель от чужих.</div>
-      </div>`
-    : '';
+  const banner = [
+    state.bootstrapPassword
+      ? `<div class="banner">${icon('alert')}
+          <div><b>Пароль администратора по умолчанию.</b>
+          Смените его в разделе <a href="#/settings">Настройки → Безопасность</a>, чтобы закрыть панель от чужих.</div>
+        </div>`
+      : '',
+    (nodes.offline || nodes.degraded)
+      ? `<div class="banner" style="border-color:rgba(248,81,73,.45);background:rgba(248,81,73,.07);color:#ffb3b8">
+          ${icon('alert')}
+          <div>${nodes.offline ? `<b>${nodes.offline} сервер(ов) не в сети.</b> ` : ''}${nodes.degraded ? `${nodes.degraded} сервер(ов) с остановленным Xray.` : ''}
+          Проверьте агент: <code class="mono">systemctl status dfxray-node</code> или логи контейнера.</div>
+          <div class="spacer"></div>
+          <button class="btn btn-sm" data-act="goto-nodes">К серверам ${icon('chevron')}</button>
+        </div>`
+      : '',
+  ].join('');
 
   const chart = areaChart(series, { height: 250 });
 
@@ -65,7 +76,7 @@ export async function render(container, { setActions, navigate }) {
           <span class="mono">${esc(node.address)}:${node.port} · ${esc(node.transport)}/${esc(node.security)}</span>
         </div>
         <div style="text-align:right">
-          ${statusBadge(node.status)}
+          ${statusBadge(node.health === 'degraded' ? 'limited' : node.status, node.health === 'degraded' ? { limited: 'Xray остановлен' } : undefined)}
           <span class="muted" style="display:block;font-size:11px;margin-top:3px">${fmtBytes(node.up_bytes + node.down_bytes)}</span>
         </div>
       </div>`)
@@ -95,6 +106,18 @@ export async function render(container, { setActions, navigate }) {
         </div>`;
     }).join('')}</div>`
     : `<div class="empty" style="border:0;padding:24px"><b>Пока нет трафика</b></div>`;
+
+  const nodeTraffic = nodes.traffic || [];
+  const nodeMax = Math.max(...nodeTraffic.map((n) => n.total), 1);
+  const serversHtml = nodeTraffic.length
+    ? `<div class="top-list">${nodeTraffic.map((node) => `
+        <div class="top-item">
+          <div class="avatar" style="background:${node.health === 'ok' ? 'rgba(46,230,168,.16)' : node.health === 'degraded' ? 'rgba(255,180,84,.16)' : 'rgba(255,95,109,.14)'};color:${node.health === 'ok' ? '#8bf0cd' : node.health === 'degraded' ? '#ffc687' : '#ff9ba3'}">${icon('server')}</div>
+          <div class="name">${esc(node.name)}</div>
+          <div class="bar"><i style="width:${Math.max((node.total / nodeMax) * 100, 2).toFixed(1)}%"></i></div>
+          <div class="val">${fmtBytes(node.total)}</div>
+        </div>`).join('')}</div>`
+    : `<div class="empty" style="border:0;padding:24px"><b>Серверов нет</b></div>`;
 
   const auditHtml = (data.audit || []).map((item) => `
     <div class="audit-item">
@@ -167,6 +190,13 @@ export async function render(container, { setActions, navigate }) {
         </div>
         <div class="card-body tight" style="padding:6px 16px 10px">${nodesHtml}</div>
       </div>
+    </div>
+
+    <div class="card section">
+      <div class="card-head"><h3>Трафик по серверам</h3><div class="spacer"></div>
+        <span class="chip">14 дней</span>
+        <button class="btn btn-ghost btn-sm" data-act="goto-nodes">Все ${icon('chevron')}</button></div>
+      <div class="card-body tight" style="padding:8px 18px 14px">${serversHtml}</div>
     </div>
 
     <div class="grid grid-2 section">

@@ -43,6 +43,10 @@ LOG_LEVEL = os.environ.get("DFX_LOG_LEVEL", "info").lower()
 
 STOP = False
 
+AGENT_VERSION = "1.2.0"
+APPLIED_REVISION = ""
+LAST_ERROR = ""
+
 
 def log(message: str, level: str = "info") -> None:
     order = {"debug": 10, "info": 20, "warn": 30, "error": 40}
@@ -78,6 +82,44 @@ def report(payload: dict) -> dict:
 
 def heartbeat(payload: dict) -> dict:
     return _request("POST", f"{PANEL_URL}/api/agent/heartbeat", payload)
+
+
+# --------------------------------------------------------------------------
+# Метрики сервера
+# --------------------------------------------------------------------------
+
+
+def system_metrics() -> dict:
+    """Данные о сервере для панели: uptime, load average, память."""
+    metrics = {"agent_version": AGENT_VERSION, "xray_running": False,
+               "uptime": 0, "load1": 0.0, "memory": {"used": 0, "total": 0}}
+    try:
+        with open("/proc/uptime", encoding="utf-8") as handle:
+            metrics["uptime"] = int(float(handle.read().split()[0]))
+    except (OSError, ValueError, IndexError):
+        metrics["uptime"] = int(time.time())
+    try:
+        metrics["load1"] = round(os.getloadavg()[0], 2)
+    except (OSError, AttributeError):
+        metrics["load1"] = 0.0
+    try:
+        meminfo = {}
+        with open("/proc/meminfo", encoding="utf-8") as handle:
+            for line in handle:
+                key, _, rest = line.partition(":")
+                meminfo[key.strip()] = int(rest.strip().split()[0]) * 1024
+        total = meminfo.get("MemTotal", 0)
+        available = meminfo.get("MemAvailable", meminfo.get("MemFree", 0))
+        metrics["memory"] = {"used": max(0, total - available), "total": total}
+    except (OSError, ValueError, IndexError):
+        pass
+    if DRY_RUN:
+        metrics["xray_running"] = True
+    else:
+        metrics["xray_running"] = xray.is_running()
+    metrics["revision"] = APPLIED_REVISION
+    metrics["last_error"] = LAST_ERROR
+    return metrics
 
 
 # --------------------------------------------------------------------------
@@ -270,18 +312,23 @@ def query_stats() -> dict[str, dict[str, int]]:
 
 
 def apply_config(config: dict) -> bool:
+    global LAST_ERROR
     if not write_config(config, CONFIG_PATH):
+        LAST_ERROR = f"не удалось записать {CONFIG_PATH}"
         return False
     ok, message = xray.test_config(CONFIG_PATH)
     if not ok:
         log(f"xray -test отклонил конфиг: {message}", "error")
+        LAST_ERROR = f"xray -test: {message}"[:400]
         return False
     log("конфиг проверен и обновлён")
     xray.restart()
+    LAST_ERROR = ""
     return True
 
 
 def loop() -> int:
+    global APPLIED_REVISION
     if not PANEL_URL:
         log("DFX_PANEL_URL не задан", "error")
         return 2
@@ -314,6 +361,7 @@ def loop() -> int:
             if new_revision != revision or not os.path.isfile(CONFIG_PATH):
                 if apply_config(payload.get("config") or {}):
                     revision = new_revision
+                    APPLIED_REVISION = new_revision
                 else:
                     log("конфиг не применён, остаётся предыдущий", "error")
             xray.ensure_running()
@@ -330,6 +378,7 @@ def loop() -> int:
                             "users": stats,
                             "node": {"up": total_up, "down": total_down},
                         },
+                        **system_metrics(),
                     }
                 )
                 if response.get("blocked"):
@@ -342,7 +391,13 @@ def loop() -> int:
                     "debug",
                 )
             else:
-                heartbeat({"xray_version": xray.detect_version(), "uptime": int(time.time() - started_at)})
+                heartbeat(
+                    {
+                        "xray_version": xray.detect_version(),
+                        "uptime": int(time.time() - started_at),
+                        **system_metrics(),
+                    }
+                )
         except urllib.error.HTTPError as exc:
             fail_count += 1
             body = ""

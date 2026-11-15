@@ -373,3 +373,31 @@ class SelfUpdateTests(unittest.TestCase):
                 self.assertIn("self-update", cap["command"])
             finally:
                 os.environ.pop("DFX_SELF_UPDATE", None)
+
+
+class MigrationTests(unittest.TestCase):
+    """Миграция старой базы до схемы с метриками серверов."""
+
+    def test_v3_migration_adds_node_columns(self):
+        import sqlite3
+
+        from app import db
+
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.executescript(
+            """
+            CREATE TABLE users (id INTEGER PRIMARY KEY);
+            CREATE TABLE groups (id INTEGER PRIMARY KEY);
+            CREATE TABLE nodes (id INTEGER PRIMARY KEY, name TEXT);
+            CREATE TABLE traffic (user_id INTEGER, node_id INTEGER, day TEXT, up INTEGER, down INTEGER);
+            INSERT INTO nodes (name) VALUES ('old node');
+            """
+        )
+        db._migrate(conn)
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(nodes)")}
+        for expected in ("region", "install_token", "agent_version", "xray_running",
+                         "uptime_seconds", "load1", "cfg_revision", "last_error"):
+            self.assertIn(expected, columns)
+        token = conn.execute("SELECT install_token FROM nodes").fetchone()[0]
+        self.assertTrue(token)

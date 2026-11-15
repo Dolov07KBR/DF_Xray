@@ -20,6 +20,7 @@ Python-зависимости.
 - [Быстрый старт](#быстрый-старт)
 - [Первая настройка](#первая-настройка)
 - [Как подключить ноду](#как-подключить-ноду)
+- [Мультисервер](docs/MULTISERVER.md)
 - [Подписки и QR-коды](#подписки-и-qr-коды)
 - [Лимиты и сроки](#лимиты-и-сроки)
 - [Архитектура](#архитектура)
@@ -57,6 +58,18 @@ Python-зависимости.
 - Публичная страница подписки `/sub/<token>/page`: тёмная витрина с QR, кольцом трафика,
   чипами протоколов и кнопками копирования.
 - QR-коды генерируются на сервере (SVG и PNG) — без JS-библиотек и внешних сервисов.
+
+**Мультисервер**
+- Любое число серверов Xray под одной панелью: клиенты, лимиты и статистика общие.
+- Онбординг нового сервера одной командой: панель отдаёт bash-скрипт с токеном
+  установки, который ставит Xray + агент как systemd-сервис (или Docker /
+  docker-compose — на выбор).
+- Агент присылает heartbeat каждые 30 секунд: версия Xray и агента, состояние
+  процесса, uptime, LA1, память и ревизию применённого конфига; ошибки `xray -test`
+  видны в карточке сервера.
+- Раздел «Агенты нод» — таблица всех серверов; дашборд — трафик по серверам и
+  предупреждение о недоступных нодах. Клиента можно ограничить отдельными
+  серверами. Подробности: [docs/MULTISERVER.md](docs/MULTISERVER.md).
 
 **Группы и маршрутизация**
 - Группы клиентов с цветом и заметкой: фильтр в списке пользователей, бейдж в карточке,
@@ -109,29 +122,33 @@ Python-зависимости.
 | --- | --- |
 | ![Дашборд](docs/screenshots/dashboard.png) | ![Пользователи](docs/screenshots/users.png) |
 
-| Карточка пользователя | Ноды |
+| Карточка клиента | Входящие |
 | --- | --- |
-| ![Карточка](docs/screenshots/user-drawer.png) | ![Ноды](docs/screenshots/nodes.png) |
+| ![Карточка](docs/screenshots/user-drawer.png) | ![Входящие](docs/screenshots/inbounds.png) |
 
-| Входящие и сканер целей | Сканер REALITY |
+| Сканер целей REALITY | Группы |
 | --- | --- |
-| ![Входящие](docs/screenshots/inbounds.png) | ![Сканер](docs/screenshots/scanner.png) |
+| ![Сканер](docs/screenshots/scanner.png) | ![Группы](docs/screenshots/groups.png) |
 
-| Группы | Исходящие |
+| Исходящие | Маршрутизация |
 | --- | --- |
-| ![Группы](docs/screenshots/groups.png) | ![Исходящие](docs/screenshots/outbounds.png) |
+| ![Исходящие](docs/screenshots/outbounds.png) | ![Маршрутизация](docs/screenshots/routing.png) |
 
-| Маршрутизация | Хосты |
+| Хосты | Конфиг Xray |
 | --- | --- |
-| ![Маршрутизация](docs/screenshots/routing.png) | ![Хосты](docs/screenshots/hosts.png) |
+| ![Хосты](docs/screenshots/hosts.png) | ![Конфиг](docs/screenshots/xray-config.png) |
 
-| Конфиг Xray | Документация API |
+| Документация API | Обновление из панели |
 | --- | --- |
-| ![Конфиг](docs/screenshots/xray-config.png) | ![API](docs/screenshots/api-docs.png) |
+| ![API](docs/screenshots/api-docs.png) | ![Обновление](docs/screenshots/updates.png) |
 
-| Обновление из панели | Палитра команд |
+| Серверы | Агенты нод |
 | --- | --- |
-| ![Обновление](docs/screenshots/updates.png) | ![Палитра](docs/screenshots/palette.png) |
+| ![Серверы](docs/screenshots/nodes.png) | ![Агенты](docs/screenshots/node-agents.png) |
+
+| Подключение нового сервера | Палитра команд |
+| --- | --- |
+| ![Подключение](docs/screenshots/node-connect.png) | ![Палитра](docs/screenshots/palette.png) |
 
 | Вход | Страница подписки |
 | --- | --- |
@@ -371,12 +388,16 @@ profile-web-page-url: https://panel.example.com/sub/<token>/page
 | `GET` | `/api/nodes/<id>/config` | сгенерированный `config.json` |
 | `POST` | `/api/nodes/<id>/probe` | TCP-проверка |
 | `POST` | `/api/nodes/<id>/reality-keys` | новые x25519-ключи |
+| `GET` | `/api/nodes/<id>/connect` | команда установки сервера (systemd / Docker) |
+| `POST` | `/api/nodes/<id>/install-token` | перевыпустить ссылку установки |
+| `GET` | `/api/node/install/<install_token>.sh` | bash-скрипт установки ноды (публичный) |
+| `GET` | `/api/node/agent.py` | исходник агента для установки (публичный) |
 | `GET` | `/api/subscriptions` | подписки и их настройки |
 | `GET/PATCH` | `/api/settings` | настройки панели |
 | `GET` | `/api/audit` | журнал |
 | `GET` | `/api/maintenance/backup` | скачать SQLite-базу |
 | `POST` | `/api/maintenance/purge-traffic` | очистить старые срезы |
-| `GET/POST` | `/api/agent/*` | служебные эндпоинты ноды (токен в `X-Node-Token`) |
+| `GET/POST` | `/api/agent/*` | конфиг, heartbeat с метриками и статистика (токен в `X-Node-Token`) |
 
 ## Безопасность
 
@@ -436,6 +457,7 @@ python3 -m app serve --port 8000   # локальный запуск без Dock
 │   ├── repo.py             # пользователи, ноды, трафик, журнал
 │   ├── xray.py             # генерация config.json и клиентских ссылок
 │   ├── reality.py          # сканер целей REALITY (TLS, ALPN, сертификаты)
+│   ├── nodeinstall.py      # скрипт установки ноды и команды подключения
 │   ├── updates.py          # проверка релизов и самообновление панели
 │   ├── qr.py               # SVG/PNG QR-коды
 │   ├── auth.py             # пароли и сессии
@@ -445,6 +467,7 @@ python3 -m app serve --port 8000   # локальный запуск без Dock
 ├── node/                   # агент ноды + Dockerfile с Xray
 ├── tests/                  # unittest (юнит + интеграционные)
 ├── docs/screenshots/       # скриншоты интерфейса
+├── docs/MULTISERVER.md     # подключение и обслуживание нескольких нод
 ├── Dockerfile              # образ панели
 ├── docker-compose.yml      # панель + нода
 ├── docker-compose.selfupdate.yml  # монтирует код для кнопки «Обновить»

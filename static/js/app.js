@@ -142,7 +142,7 @@ const NAV = [
     items: [
       ['#/xray?tab=config', 'Конфиг ноды'],
       ['#/xray?tab=reality', 'Reality-ключи'],
-      ['#/nodes', 'Агенты нод'],
+      ['#/nodes?tab=agents', 'Агенты нод'],
     ],
   },
   { href: '#/api-docs', label: 'Документация API', icon: 'book' },

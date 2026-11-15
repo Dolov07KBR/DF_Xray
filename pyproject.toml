@@ -1,6 +1,6 @@
 [project]
 name = "dfxray-panel"
-version = "1.1.0"
+version = "1.2.0"
 description = "DF_Xray Panel — лёгкая панель управления Xray с подписками, QR-кодами и мульти-нодами"
 readme = "README.md"
 requires-python = ">=3.9"
