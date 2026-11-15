@@ -59,6 +59,7 @@ NODE_FIELDS = (
     "flow",
     "alpn",
     "enabled",
+    "drain",
     "note",
     "sort",
 )
@@ -402,6 +403,8 @@ def serialize_node(row: sqlite3.Row | dict[str, Any], with_secrets: bool = False
         "flow": data.get("flow") or "",
         "alpn": data.get("alpn") or "",
         "enabled": bool(to_int(data.get("enabled"))),
+        "drain": bool(to_int(data.get("drain"))),
+        "drained_at": data.get("drained_at") or "",
         "status": node_status(data),
         "health": node_health(data),
         "last_seen": data.get("last_seen") or "",
@@ -523,8 +526,10 @@ def update_node(node_id: int, payload: dict[str, Any]) -> None:
     for key in NODE_FIELDS:
         if key not in payload:
             continue
-        if key in ("enabled",):
+        if key in ("enabled", "drain"):
             fields[key] = 1 if to_bool(payload[key]) else 0
+            if key == "drain":
+                fields["drained_at"] = iso() if fields[key] else None
         elif key == "port":
             fields[key] = to_int(payload[key], 443)
         elif key in ("sort",):
@@ -574,6 +579,27 @@ def traffic_by_node(days: int = 14) -> list[dict[str, Any]]:
         )
     result.sort(key=lambda item: item["total"], reverse=True)
     return result
+
+
+def replace_user_node(from_node_id: int, to_node_id: int) -> int:
+    """Перевести клиентов, закреплённых за нодой, на другую ноду."""
+    moved = 0
+    rows = db.all("SELECT id, node_ids FROM users")
+    for row in rows:
+        raw = (row["node_ids"] or "").strip()
+        if not raw:
+            continue
+        ids = [item.strip() for item in raw.split(",") if item.strip()]
+        if str(from_node_id) not in ids:
+            continue
+        result: list[str] = []
+        for item in ids:
+            value = str(to_node_id) if item == str(from_node_id) else item
+            if value not in result:
+                result.append(value)
+        db.run("UPDATE users SET node_ids = ? WHERE id = ?", (",".join(result), row["id"]))
+        moved += 1
+    return moved
 
 
 def delete_node(node_id: int) -> None:

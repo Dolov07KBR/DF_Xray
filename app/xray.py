@@ -435,6 +435,10 @@ def build_links(
     for node in nodes:
         if not node["enabled"]:
             continue
+        node_keys = node.keys() if hasattr(node, "keys") else ()
+        if node["drain"] if "drain" in node_keys else 0:
+            # Drain: сервер дорабатывает текущих клиентов, но в новые подписки не попадает.
+            continue
         if allowed and int(node["id"]) not in allowed:
             continue
         links.append(

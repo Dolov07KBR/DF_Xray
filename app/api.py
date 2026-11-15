@@ -8,7 +8,7 @@ import json
 import re
 from typing import Any
 
-from . import auth, config, db, nodeinstall, qr, reality, repo, updates, xray
+from . import auth, config, db, latency, nodeinstall, notify, qr, reality, repo, updates, xray
 from .server import (
     ROUTES,
     ApiError,
@@ -56,6 +56,9 @@ def _user_payload(req: Request, row) -> dict[str, Any]:
     nodes = [n for n in repo.list_nodes() if n["enabled"]]
     settings = db.get_settings()
     links = xray.build_links(row, nodes, settings.get("panel_title", "DF_Xray"))
+    if links and settings.get("sub_sort_by_latency", "1") == "1":
+        latencies = latency.measure([n for n in nodes if not n["drain"]])
+        links = latency.sort_links(links, latencies)
     for link in links:
         if base:
             link["qr_url"] = (
@@ -83,11 +86,30 @@ def login(req: Request) -> Response:
     payload = req.json()
     username = (payload.get("username") or "").strip()
     password = payload.get("password") or ""
+    challenge = str(payload.get("challenge") or "")
+    code = str(payload.get("code") or "")
     row = auth.find_admin(username)
-    if row is None or not auth.verify_password(password, row["password_hash"]):
+    # Второй шаг 2FA: действующий challenge уже подтверждает, что пароль верный.
+    resumed = bool(row) and bool(challenge) and auth.resolve_challenge(challenge) == row["id"]
+    if not resumed and (row is None or not auth.verify_password(password, row["password_hash"])):
         auth.record_failed_login(ip)
         repo.audit("auth.login_failed", username, "неверный логин или пароль", ip=ip)
         raise ApiError(401, "Неверное имя пользователя или пароль")
+    if auth.totp_status(row["id"])["enabled"]:
+        if not code:
+            raw = auth.create_challenge(row["id"])
+            return json_response(
+                {"totp_required": True, "challenge": raw, "username": row["username"]}
+            )
+        if not resumed:
+            auth.record_failed_login(ip)
+            repo.audit("auth.2fa_failed", username, "истёк challenge", ip=ip)
+            raise ApiError(401, "Время на ввод кода истекло — войдите заново")
+        if not auth.check_second_factor(row["id"], code):
+            auth.record_failed_login(ip)
+            repo.audit("auth.2fa_failed", username, "неверный код", ip=ip)
+            raise ApiError(401, "Неверный код двухфакторной аутентификации")
+        auth.drop_challenge(challenge)
     auth.clear_login_attempts(ip)
     raw = auth.create_session(row["id"], ip, req.header("user-agent"))
     resp = json_response(
@@ -96,6 +118,7 @@ def login(req: Request) -> Response:
                 "id": row["id"],
                 "username": row["username"],
                 "last_login_at": iso(),
+                "totp": auth.totp_status(row["id"])["enabled"],
             },
             "bootstrap_password": db.get_setting("password_changed") != "1",
         }
@@ -457,7 +480,11 @@ def nodes_connect(req: Request) -> Response:
     row = _node_or_404(req.params["node_id"])
     install_token = repo.node_install_token(row["id"])
     payload = nodeinstall.connect_payload(
-        repo.serialize_node(row, with_secrets=True), req.base_url(), install_token
+        repo.serialize_node(row, with_secrets=True),
+        req.base_url(),
+        install_token,
+        tls_domain=(row["sni"] or "") if row["security"] == "tls" else "",
+        acme_email=db.get_settings().get("acme_email", ""),
     )
     payload["node"] = {
         "id": row["id"],
@@ -477,9 +504,36 @@ def nodes_install_token(req: Request) -> Response:
     _audit(req, "node.rotate_install_token", row["name"], f"id={row['id']}")
     return json_response(
         nodeinstall.connect_payload(
-            repo.serialize_node(row, with_secrets=True), req.base_url(), value
+            repo.serialize_node(row, with_secrets=True),
+            req.base_url(),
+            value,
+            tls_domain=(row["sni"] or "") if row["security"] == "tls" else "",
+            acme_email=db.get_settings().get("acme_email", ""),
         )
     )
+
+
+@post(r"/api/nodes/(?P<node_id>\d+)/drain")
+def nodes_drain(req: Request) -> Response:
+    """Вывести сервер из новых подписок (или вернуть в работу)."""
+    row = _node_or_404(req.params["node_id"])
+    drain = to_bool(req.json().get("drain", True))
+    repo.update_node(row["id"], {"drain": drain})
+    _audit(req, "node.drain" if drain else "node.undrain", row["name"], str(row["id"]))
+    return json_response(repo.serialize_node(_node_or_404(row["id"]), with_secrets=True))
+
+
+@post(r"/api/nodes/(?P<node_id>\d+)/migrate")
+def nodes_migrate(req: Request) -> Response:
+    """Перевести клиентов с ноды на другую ноду."""
+    row = _node_or_404(req.params["node_id"])
+    payload = req.json()
+    target = _node_or_404(payload.get("to_node_id", 0))
+    if target["id"] == row["id"]:
+        raise ApiError(400, "Выберите другой сервер")
+    moved = repo.replace_user_node(row["id"], target["id"])
+    _audit(req, "node.migrate", row["name"], f"→ {target['name']}: {moved}")
+    return json_response({"moved": moved, "to": target["name"], "from": row["name"]})
 
 
 @post(r"/api/nodes/(?P<node_id>\d+)/probe")
@@ -530,6 +584,96 @@ def nodes_rotate_token(req: Request) -> Response:
 
 
 # --------------------------------------------------------------------------
+# Двухфакторная аутентификация и API-токены
+# --------------------------------------------------------------------------
+
+
+@get("/api/account/2fa")
+def account_2fa_status(req: Request) -> Response:
+    status = auth.totp_status(req.admin["id"])
+    status["issuer"] = db.get_setting("panel_title", "DF_Xray") or "DF_Xray"
+    return json_response(status)
+
+
+@post("/api/account/2fa/start")
+def account_2fa_start(req: Request) -> Response:
+    admin = auth.get_admin(req.admin["id"])
+    if admin is None:
+        raise ApiError(404, "Администратор не найден")
+    title = db.get_setting("panel_title", "DF_Xray") or "DF_Xray"
+    data = auth.begin_totp(admin["id"], issuer=title, account=admin["username"])
+    data["qr_svg"] = qr.svg(data["uri"], module_px=5, border=2, title="2FA")
+    _audit(req, "account.2fa_start")
+    return json_response(data)
+
+
+@post("/api/account/2fa/enable")
+def account_2fa_enable(req: Request) -> Response:
+    code = str(req.json().get("code") or "")
+    if not auth.confirm_totp(req.admin["id"], code):
+        raise ApiError(400, "Код не подошёл. Проверьте время на телефоне")
+    _audit(req, "account.2fa_enabled")
+    return json_response(auth.totp_status(req.admin["id"]))
+
+
+@post("/api/account/2fa/disable")
+def account_2fa_disable(req: Request) -> Response:
+    payload = req.json()
+    admin = auth.find_admin(req.admin["username"])
+    if admin is None or not auth.verify_password(
+        payload.get("password") or "", admin["password_hash"]
+    ):
+        raise ApiError(403, "Неверный пароль")
+    auth.disable_totp(req.admin["id"])
+    _audit(req, "account.2fa_disabled")
+    return json_response({"enabled": False})
+
+
+@post("/api/account/2fa/recovery")
+def account_2fa_recovery(req: Request) -> Response:
+    if not auth.totp_status(req.admin["id"])["enabled"]:
+        raise ApiError(400, "Сначала включите двухфакторную аутентификацию")
+    admin = auth.find_admin(req.admin["username"])
+    if admin is None or not auth.verify_password(
+        req.json().get("password") or "", admin["password_hash"]
+    ):
+        raise ApiError(403, "Неверный пароль")
+    codes = auth.regenerate_recovery(req.admin["id"])
+    _audit(req, "account.2fa_recovery")
+    return json_response({"recovery_codes": codes})
+
+
+@get("/api/tokens")
+def tokens_index(req: Request) -> Response:
+    items = auth.list_api_tokens()
+    return json_response({"items": items, "total": len(items)})
+
+
+@post("/api/tokens")
+def tokens_create(req: Request) -> Response:
+    payload = req.json()
+    try:
+        raw, item = auth.create_api_token(
+            payload.get("name") or "",
+            payload.get("scope") or "read",
+            to_int(payload.get("expires_days")),
+            req.admin.get("username", ""),
+        )
+    except ValueError as exc:
+        raise ApiError(400, str(exc)) from exc
+    _audit(req, "token.create", item["name"], f"scope={item['scope']}")
+    return json_response({**item, "token": raw}, status=201)
+
+
+@delete(r"/api/tokens/(?P<token_id>\d+)")
+def tokens_delete(req: Request) -> Response:
+    if not auth.delete_api_token(to_int(req.params["token_id"])):
+        raise ApiError(404, "Токен не найден")
+    _audit(req, "token.delete", req.params["token_id"])
+    return json_response({"ok": True})
+
+
+# --------------------------------------------------------------------------
 # Подписки, настройки, журнал
 # --------------------------------------------------------------------------
 
@@ -561,6 +705,8 @@ BOOL_SETTINGS = (
     "block_ads",
     "block_private",
     "route_ru_direct",
+    "sub_sort_by_latency",
+    "update_auto",
 )
 INT_SETTINGS = (
     "sub_update_interval",
@@ -568,6 +714,51 @@ INT_SETTINGS = (
     "default_device_limit",
     "traffic_retention_days",
 )
+
+
+@get("/api/notifications")
+def notifications_info(req: Request) -> Response:
+    data = notify.serialize_settings()
+    data["pending"] = notify.pending_state()
+    return json_response(data)
+
+
+@patch("/api/notifications")
+def notifications_update(req: Request) -> Response:
+    payload = req.json()
+    fields = {
+        "notify_enabled": "1" if to_bool(payload.get("enabled")) else "0",
+        "notify_telegram_token": str(payload.get("telegram_token") or "").strip(),
+        "notify_telegram_chat": str(payload.get("telegram_chat") or "").strip(),
+        "notify_webhook": str(payload.get("webhook") or "").strip(),
+    }
+    events = payload.get("events")
+    if events is not None:
+        if not isinstance(events, list):
+            raise ApiError(400, "events должен быть списком")
+        unknown = [item for item in events if item not in notify.EVENTS]
+        if unknown:
+            raise ApiError(400, f"Неизвестные события: {', '.join(map(str, unknown))}")
+        fields["notify_events"] = ",".join(str(item) for item in events)
+    for key, value in fields.items():
+        db.set_setting(key, value)
+    _audit(req, "notify.update", "уведомления", f"enabled={fields['notify_enabled']}")
+    return json_response(notify.serialize_settings())
+
+
+@post("/api/notifications/test")
+def notifications_test(req: Request) -> Response:
+    result = notify.test()
+    _audit(req, "notify.test", "уведомления", "ok" if result["ok"] else "fail")
+    if not result["ok"]:
+        raise ApiError(400, result.get("error") or "Не удалось отправить сообщение")
+    return json_response(result)
+
+
+@post("/api/notifications/check")
+def notifications_check(req: Request) -> Response:
+    sent = notify.check_once()
+    return json_response({"sent": sent, "total": len(sent)})
 
 
 @get("/api/settings")
@@ -606,6 +797,8 @@ SETTING_TYPES = {
     "update_auto": bool,
     "update_command": str,
     "install_dir": str,
+    "sub_sort_by_latency": bool,
+    "acme_email": str,
 }
 
 

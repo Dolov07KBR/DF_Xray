@@ -62,10 +62,13 @@ def install_script(
     node_name: str = "",
     port: int = 443,
     agent_url: str = "",
+    tls_domain: str = "",
+    acme_email: str = "",
 ) -> str:
     """Bash-скрипт установки ноды (Xray + агент + systemd)."""
     url = panel_url(url)
     agent_url = agent_url or f"{url}/api/node/agent.py"
+    acme_arg = f"-m {_q(acme_email)}" if acme_email else ""
     title = node_name or "DF_Xray node"
     return f"""#!/usr/bin/env bash
 # DF_Xray Panel → установка ноды «{title}».
@@ -107,6 +110,28 @@ if [ ! -x /usr/local/bin/xray ]; then
     || die "не удалось установить Xray"
 else
   log "Xray уже установлен: $(/usr/local/bin/xray -version 2>/dev/null | head -1)"
+fi
+
+TLS_DOMAIN={_q(tls_domain)}
+ACME_EMAIL={_q(acme_email)}
+if [ -n "$TLS_DOMAIN" ]; then
+  log "выпускаю TLS-сертификат для $TLS_DOMAIN (Let's Encrypt, standalone)"
+  if ! command -v certbot >/dev/null; then
+    if command -v apt-get >/dev/null; then apt-get install -y -qq certbot;
+    elif command -v dnf >/dev/null; then dnf install -y -q certbot;
+    elif command -v yum >/dev/null; then yum install -y -q certbot; fi
+  fi
+  if command -v certbot >/dev/null; then
+    certbot certonly --standalone --non-interactive --agree-tos --keep-until-expiring -d "$TLS_DOMAIN" {acme_arg} || log "certbot не смог выпустить сертификат — положите файлы в /etc/xray/cert вручную"
+    install -d -m 750 /etc/xray/cert
+    if [ -f "/etc/letsencrypt/live/$TLS_DOMAIN/fullchain.pem" ]; then
+      ln -sf "/etc/letsencrypt/live/$TLS_DOMAIN/fullchain.pem" /etc/xray/cert/fullchain.pem
+      ln -sf "/etc/letsencrypt/live/$TLS_DOMAIN/privkey.pem" /etc/xray/cert/privkey.pem
+      log "сертификат готов: /etc/xray/cert/fullchain.pem"
+    fi
+  else
+    log "certbot не установлен — сертификат нужно положить вручную"
+  fi
 fi
 
 log "ставлю агент панели"
@@ -160,7 +185,13 @@ log "порт $XRAY_PORT должен быть открыт в фаерволе 
 """
 
 
-def connect_payload(node: dict[str, Any], base_url: str, install_token: str) -> dict[str, Any]:
+def connect_payload(
+    node: dict[str, Any],
+    base_url: str,
+    install_token: str,
+    tls_domain: str = "",
+    acme_email: str = "",
+) -> dict[str, Any]:
     """Всё, что нужно интерфейсу, чтобы показать команду установки."""
     url = panel_url(base_url)
     token = node.get("agent_token") or ""
@@ -178,4 +209,5 @@ def connect_payload(node: dict[str, Any], base_url: str, install_token: str) -> 
         "agent_url": f"{url}/api/node/agent.py",
         "port": port,
         "https": url.startswith("https://"),
+        "tls_domain": tls_domain,
     }

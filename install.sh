@@ -14,7 +14,7 @@
 set -Eeuo pipefail
 
 APP_NAME="DF_Xray Panel"
-APP_VERSION="1.2.0"
+APP_VERSION="1.3.0"
 REPO="${DFX_REPO:-Dolov07KBR/DF_Xray}"
 DEFAULT_REF="${DFX_REF:-main}"
 INSTALL_DIR="${DFX_INSTALL_DIR:-/opt/dfxray}"

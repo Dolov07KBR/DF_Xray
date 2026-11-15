@@ -59,6 +59,11 @@ def _subscription_for(sub_token: str) -> tuple[Any, dict[str, Any]]:
     settings = db.get_settings()
     nodes = [n for n in repo.list_nodes() if n["enabled"]]
     links = xray.build_links(user, nodes, settings.get("panel_title", "DF_Xray"))
+    if links and settings.get("sub_sort_by_latency", "1") == "1":
+        from . import latency
+
+        latencies = latency.measure([n for n in nodes if not n["drain"]])
+        links = latency.sort_links(links, latencies)
     active = repo.user_status(user) == "active"
     payload = {
         "user": user,

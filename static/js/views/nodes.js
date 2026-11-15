@@ -52,7 +52,7 @@ function cardHtml(node) {
         </div>
         ${healthBadge(node)}
       </div>
-      <div class="chips">${protoChips(node)}${node.region ? `<span class="chip">${esc(node.region)}</span>` : ''}${node.enabled ? '' : '<span class="chip">выключена</span>'}
+      <div class="chips">${protoChips(node)}${node.region ? `<span class="chip">${esc(node.region)}</span>` : ''}${node.drain ? '<span class="chip chip-warn">выведена из подписок</span>' : ''}${node.enabled ? '' : '<span class="chip">выключена</span>'}
       </div>
       <div class="nc-stats">
         <div class="nc-stat"><span>Клиенты</span><b>${node.users_count ?? 0}</b></div>
@@ -69,6 +69,8 @@ function cardHtml(node) {
         <button class="btn btn-sm btn-primary" data-act="connect" data-id="${node.id}">${icon('bolt')}Подключить</button>
         <button class="btn btn-sm" data-act="config" data-id="${node.id}">${icon('terminal')}Конфиг</button>
         <div class="spacer"></div>
+        <button class="icon-btn" data-act="migrate" data-id="${node.id}" title="Перевести клиентов на другую ноду">${icon('route')}</button>
+        <button class="icon-btn" data-act="drain" data-id="${node.id}" title="${node.drain ? 'Вернуть в подписки' : 'Вывести из подписок (drain)'}">${icon('power_off')}</button>
         <button class="icon-btn" data-act="probe" data-id="${node.id}" title="Проверить порт">${icon('wifi')}</button>
         <button class="icon-btn" data-act="edit" data-id="${node.id}" title="Изменить">${icon('edit')}</button>
         <button class="icon-btn" data-act="toggle" data-id="${node.id}" title="${node.enabled ? 'Выключить' : 'Включить'}">${icon('power')}</button>
@@ -343,6 +345,57 @@ export async function openNodeConnect(nodeId) {
     } catch (err) {
       toast(err.message, 'err');
     }
+  });
+}
+
+/* ------------------------------------------------------- миграция клиентов */
+
+async function openMigrate(node, onDone) {
+  const all = await api('/api/nodes');
+  const items = (all.items || all.nodes || []).filter((item) => item.id !== node.id);
+  if (!items.length) {
+    toast('Других серверов нет — сначала добавьте ноду', 'err');
+    return;
+  }
+  openModal({
+    title: 'Перевести клиентов',
+    subtitle: node ? node.name : '',
+    body: `
+      <p class="muted" style="font-size:12.5px;line-height:1.7;margin-bottom:14px">
+        Все клиенты, закреплённые за этим сервером, будут переключены на выбранную ноду.
+        Удобно перед выводом сервера из эксплуатации (drain).
+      </p>
+      <div class="field">
+        <label>Новый сервер</label>
+        <select class="input" name="target">
+          ${items.map((item) => `<option value="${item.id}">${esc(item.name)} · ${esc(item.address)}:${item.port}</option>`).join('')}
+        </select>
+      </div>
+      <div class="login-error" id="migrate-error"></div>`,
+    footer: `<button class="btn" data-act="cancel">Отмена</button>
+      <button class="btn btn-primary" data-act="run">Перевести</button>`,
+    onMount(modal) {
+      modal.addEventListener('click', async (ev) => {
+        const el = ev.target.closest('[data-act]');
+        if (!el) return;
+        if (el.dataset.act === 'cancel') closeLayer();
+        if (el.dataset.act !== 'run') return;
+        const err = modal.querySelector('#migrate-error');
+        err.classList.remove('show');
+        try {
+          const result = await api(`/api/nodes/${node.id}/migrate`, {
+            method: 'POST',
+            body: { to_node_id: Number(modal.querySelector('[name="target"]').value) },
+          });
+          closeLayer();
+          toast(`Переведено клиентов: ${result.moved}`);
+          if (onDone) onDone();
+        } catch (error) {
+          err.textContent = error.message;
+          err.classList.add('show');
+        }
+      });
+    },
   });
 }
 
@@ -635,6 +688,23 @@ export async function render(container, ctx) {
         await api(`/api/nodes/${id}`, { method: 'PATCH', body: { enabled: !(node && node.enabled) } });
         toast(node && node.enabled ? 'Сервер выключен' : 'Сервер включён');
         await render(container, ctx);
+      } else if (act === 'drain') {
+        const off = !(node && node.drain);
+        const ok = await confirmDialog({
+          title: off ? 'Вывести сервер из подписок?' : 'Вернуть сервер в подписки?',
+          text: off
+            ? '<b>' + esc(node ? node.name : '') + '</b> перестанет выдаваться клиентам в новых подписках, '
+              + 'Xray на сервере продолжит работать. Клиентов можно перевести на другую ноду кнопкой маршрута.'
+            : '<b>' + esc(node ? node.name : '') + '</b> снова начнёт выдаваться в подписках.',
+          confirmText: off ? 'Вывести' : 'Вернуть',
+          danger: off,
+        });
+        if (!ok) return;
+        await api(`/api/nodes/${id}/drain`, { method: 'POST', body: { drain: off } });
+        toast(off ? 'Сервер выведен из подписок' : 'Сервер возвращён в подписки');
+        await render(container, ctx);
+      } else if (act === 'migrate') {
+        openMigrate(node, () => render(container, ctx));
       } else if (act === 'probe') {
         el.disabled = true;
         el.innerHTML = icon('refresh');

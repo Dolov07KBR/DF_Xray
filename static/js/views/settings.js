@@ -1,12 +1,14 @@
 /* Настройки панели: общие, подписка, маршрутизация, безопасность, обслуживание. */
 
 import {
-  api, bind, confirmDialog, esc, formChecked, formValue, icon, state, toast,
+  api, bind, closeLayer, confirmDialog, copy, esc, formChecked, formValue, icon,
+  openModal, state, toast,
 } from '../core.js';
 
 const SECTIONS = [
   { id: 'general', label: 'Общие', icon: 'settings' },
   { id: 'subscription', label: 'Подписки', icon: 'link' },
+  { id: 'notifications', label: 'Уведомления', icon: 'bell' },
   { id: 'security', label: 'Безопасность', icon: 'shield' },
   { id: 'update', label: 'Обновление', icon: 'refresh' },
   { id: 'maintenance', label: 'Обслуживание', icon: 'download' },
@@ -97,6 +99,16 @@ function sectionHtml(id, settings) {
         <div style="display:flex;flex-direction:column;gap:12px;margin-top:16px">
           ${sw('sub_page_enabled', 'Публичная страница подписки', settings.sub_page_enabled, 'Адрес /sub/&lt;токен&gt;/page с QR-кодом и расходом.')}
           ${sw('sub_show_nodes', 'Показывать список нод на странице', settings.sub_show_nodes)}
+          ${sw('sub_sort_by_latency', 'Сортировать ноды по задержке', settings.sub_sort_by_latency,
+               'Панель измеряет TCP-задержку до нод (кэш 5 минут) и ставит ближайшие первыми. В ссылке появляется поле <code class="mono">latency_ms</code>.')}
+        </div>
+        <div class="form-grid" style="margin-top:16px">
+          <div class="field full">
+            <label>E-mail для Let's Encrypt</label>
+            <input class="input mono" name="acme_email" value="${esc(settings.acme_email || '')}" placeholder="admin@example.com">
+            <div class="hint">Скрипт установки TLS-ноды сам выпускает сертификат через certbot на домен из поля SNI.
+              Нужен свободный порт 80 и DNS-запись домена на сервер.</div>
+          </div>
         </div>
         <div style="margin-top:16px"><button class="btn btn-primary" type="submit">Сохранить</button></div>
       </div>
@@ -134,7 +146,23 @@ function sectionHtml(id, settings) {
           </p>
           <button class="btn btn-danger" data-act="revoke">${icon('logout')}Завершить другие сессии</button>
         </div>
+      </div>
+      <div class="card" style="margin-top:16px" id="totp-card">
+        <div class="card-head"><h3>Двухфакторная аутентификация</h3></div>
+        <div class="card-body"><div class="skeleton" style="height:64px"></div></div>
+      </div>
+      <div class="card" style="margin-top:16px" id="token-card">
+        <div class="card-head"><h3>API-токены</h3><div class="spacer"></div>
+          <button class="btn btn-sm" data-act="token-new">${icon('plus')}Создать токен</button></div>
+        <div class="card-body" id="token-list"><div class="skeleton" style="height:64px"></div></div>
       </div>`;
+  }
+  if (id === 'notifications') {
+    return `<div class="card" id="notify-card">
+      <div class="card-head"><h3>Уведомления</h3><div class="spacer"></div>
+        <span class="chip chip-quiet" id="notify-state">загрузка…</span></div>
+      <div class="card-body"><div class="skeleton" style="height:220px"></div></div>
+    </div>`;
   }
   if (id === 'update') {
     return `
@@ -373,8 +401,17 @@ export async function render(container, ctx) {
     bindSettings(container);
   };
 
+  const afterLayout = () => {
+    if (activeSection === 'update') hydrateUpdate(container);
+    if (activeSection === 'security') {
+      hydrateTotp(container);
+      hydrateTokens(container);
+    }
+    if (activeSection === 'notifications') hydrateNotifications(container);
+  };
+
   layout();
-  if (activeSection === 'update') hydrateUpdate(container);
+  afterLayout();
 
   bind(container, 'click', async (ev) => {
     const sectionBtn = ev.target.closest('[data-section]');
@@ -386,7 +423,7 @@ export async function render(container, ctx) {
         return;
       }
       layout();
-      if (activeSection === 'update') hydrateUpdate(container);
+      afterLayout();
       return;
     }
     const action = ev.target.closest('[data-act]');
@@ -405,6 +442,34 @@ export async function render(container, ctx) {
         await runUpdateCheck(container, action);
       } else if (action.dataset.act === 'apply-update') {
         await runUpdateApply(container, action);
+      } else if (action.dataset.act === 'totp-enable') {
+        await startTotpSetup(container);
+      } else if (action.dataset.act === 'totp-disable') {
+        askPassword({
+          title: 'Выключить 2FA?',
+          text: 'Для подтверждения введите текущий пароль. Сессии будут завершены.',
+          confirmText: 'Выключить', danger: true,
+          onSubmit: async (password) => {
+            await api('/api/account/2fa/disable', { method: 'POST', body: { password } });
+            closeLayer();
+            toast('2FA выключена');
+            hydrateTotp(container);
+          },
+        });
+      } else if (action.dataset.act === 'totp-recovery') {
+        askPassword({
+          title: 'Новые резервные коды',
+          text: 'Старые коды перестанут работать.',
+          confirmText: 'Сгенерировать',
+          onSubmit: async (password) => {
+            const result = await api('/api/account/2fa/recovery', { method: 'POST', body: { password } });
+            closeLayer();
+            showRecoveryCodes(result.recovery_codes || []);
+            hydrateTotp(container);
+          },
+        });
+      } else if (action.dataset.act === 'token-new') {
+        openTokenCreate(container);
       } else if (action.dataset.act === 'purge') {
         const ok = await confirmDialog({
           title: 'Очистить старую статистику?',
@@ -457,6 +522,8 @@ function bindSettings(container) {
         default_device_limit: Number(formValue(f, 'default_device_limit', '0') || 0),
         sub_page_enabled: formChecked(f, 'sub_page_enabled'),
         sub_show_nodes: formChecked(f, 'sub_show_nodes'),
+        sub_sort_by_latency: formChecked(f, 'sub_sort_by_latency'),
+        acme_email: formValue(f, 'acme_email').trim(),
       };
       try {
         await api('/api/settings', { method: 'PATCH', body });
@@ -497,5 +564,400 @@ function bindSettings(container) {
         passwordForm.reset();
       } catch (err) { toast(err.message, 'err'); }
     });
+  }
+}
+
+
+/* ------------------------------------------------- 2FA, токены, уведомления --- */
+
+function stamp(value) {
+  if (!value) return '—';
+  const raw = String(value);
+  const date = new Date(raw.length <= 10 ? `${raw}T00:00:00Z` : raw);
+  if (Number.isNaN(date.getTime())) return raw;
+  return date.toLocaleString('ru-RU', { dateStyle: 'short', timeStyle: 'short' });
+}
+
+/* --- двухфакторная аутентификация --- */
+
+function paintTotp(box, data) {
+  const enabled = Boolean(data.enabled);
+  box.innerHTML = `
+    <div class="card-head">
+      <div><h3>Двухфакторная аутентификация</h3>
+        <div class="hint">TOTP-код из Google Authenticator, Aegis, 1Password или другого приложения.</div></div>
+      <div class="spacer"></div>
+      <span class="status ${enabled ? 'online' : 'unknown'}"><span class="dot"></span>${enabled ? 'включена' : 'выключена'}</span>
+    </div>
+    <div class="card-body">
+      ${enabled ? `
+        <div class="kv"><span>Подтверждена</span><b>${esc(stamp(data.confirmed_at))}</b></div>
+        <div class="kv"><span>Резервных кодов осталось</span><b>${data.recovery_left ?? 0}</b></div>
+        <p class="muted" style="font-size:12.5px;margin:12px 0 16px">
+          Пароль + код запрашиваются при каждом входе. Резервные коды одноразовые: сохраните их в надёжном месте.
+        </p>
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          <button class="btn" data-act="totp-recovery">${icon('key')}Новые резервные коды</button>
+          <button class="btn btn-danger" data-act="totp-disable">${icon('lock')}Выключить 2FA</button>
+        </div>` : `
+        <p class="muted" style="font-size:12.5px;margin-bottom:16px">
+          Включите 2FA, чтобы одного пароля было недостаточно. Панель покажет QR-код и 8 резервных кодов.
+        </p>
+        <button class="btn btn-primary" data-act="totp-enable">${icon('shield')}Включить 2FA</button>`}
+    </div>`;
+}
+
+async function hydrateTotp(container) {
+  const box = container.querySelector('#totp-card');
+  if (!box) return;
+  try {
+    paintTotp(box, await api('/api/account/2fa'));
+  } catch (err) {
+    box.innerHTML = `<div class="card-body"><div class="notice warn">${esc(err.message)}</div></div>`;
+  }
+}
+
+function showRecoveryCodes(codes) {
+  openModal({
+    title: 'Резервные коды',
+    body: `
+      <div class="notice warn" style="margin-bottom:14px">${icon('alert')}
+        <div>Каждый код одноразовый. Сохраните их сейчас — повторно панель их не покажет.</div></div>
+      <div class="recovery-grid">${codes.map((code) => `<code class="mono">${esc(code)}</code>`).join('')}</div>`,
+    footer: `<button class="btn" data-act="copy-codes">${icon('copy')}Копировать</button>
+      <button class="btn btn-primary" data-act="close">Готово</button>`,
+    onMount(modal) {
+      modal.addEventListener('click', async (ev) => {
+        const el = ev.target.closest('[data-act]');
+        if (!el) return;
+        if (el.dataset.act === 'copy-codes') await copy(codes.join('\n'), 'Коды скопированы');
+        if (el.dataset.act === 'close') closeLayer();
+      });
+    },
+  });
+}
+
+async function startTotpSetup(container) {
+  const data = await api('/api/account/2fa/start', { method: 'POST' });
+  openModal({
+    title: 'Подключить 2FA',
+    body: `
+      <div class="totp-setup">
+        <div class="totp-qr">${data.qr_svg || ''}</div>
+        <div>
+          <p class="muted" style="font-size:12.5px;line-height:1.7">
+            Отсканируйте QR-код в приложении-аутентификаторе или введите секрет вручную:
+          </p>
+          <div class="sub-url-row" style="margin:8px 0 14px">
+            <input class="input mono" value="${esc(data.secret_pretty || data.secret)}" readonly onclick="this.select()">
+            <button class="icon-btn" data-act="copy-secret" title="Копировать">${icon('copy')}</button>
+          </div>
+          <div class="field">
+            <label>Код из приложения</label>
+            <input class="input mono" name="code" inputmode="numeric" placeholder="123 456" autocomplete="one-time-code">
+            <div class="hint">Введите код, чтобы подтвердить, что приложение настроено.</div>
+          </div>
+          <div class="login-error" id="totp-error"></div>
+        </div>
+      </div>`,
+    footer: `<button class="btn" data-act="cancel">Отмена</button>
+      <button class="btn btn-primary" data-act="confirm">Включить</button>`,
+    onMount(modal) {
+      const input = modal.querySelector('[name="code"]');
+      input.focus();
+      const confirm = async () => {
+        const err = modal.querySelector('#totp-error');
+        err.classList.remove('show');
+        try {
+          await api('/api/account/2fa/enable', { method: 'POST', body: { code: input.value.trim() } });
+          closeLayer();
+          toast('2FA включена');
+          hydrateTotp(container);
+          showRecoveryCodes(data.recovery_codes || []);
+        } catch (error) {
+          err.textContent = error.message;
+          err.classList.add('show');
+          input.select();
+        }
+      };
+      input.addEventListener('keydown', (ev) => { if (ev.key === 'Enter') { ev.preventDefault(); confirm(); } });
+      modal.addEventListener('click', async (ev) => {
+        const el = ev.target.closest('[data-act]');
+        if (!el) return;
+        if (el.dataset.act === 'copy-secret') await copy(data.secret, 'Секрет скопирован');
+        if (el.dataset.act === 'cancel') closeLayer();
+        if (el.dataset.act === 'confirm') await confirm();
+      });
+    },
+  });
+}
+
+function askPassword({ title, text, confirmText, danger = false, onSubmit }) {
+  openModal({
+    title,
+    body: `
+      <p class="muted" style="font-size:12.5px;margin-bottom:14px">${text}</p>
+      <div class="field">
+        <label>Текущий пароль</label>
+        <input class="input" type="password" name="password" autocomplete="current-password">
+      </div>
+      <div class="login-error" id="pw-error"></div>`,
+    footer: `<button class="btn" data-act="cancel">Отмена</button>
+      <button class="btn ${danger ? 'btn-danger' : 'btn-primary'}" data-act="ok">${confirmText}</button>`,
+    onMount(modal) {
+      const input = modal.querySelector('[name="password"]');
+      input.focus();
+      const run = async () => {
+        const err = modal.querySelector('#pw-error');
+        err.classList.remove('show');
+        try {
+          await onSubmit(input.value);
+        } catch (error) {
+          err.textContent = error.message;
+          err.classList.add('show');
+          input.select();
+        }
+      };
+      input.addEventListener('keydown', (ev) => { if (ev.key === 'Enter') { ev.preventDefault(); run(); } });
+      modal.addEventListener('click', async (ev) => {
+        const el = ev.target.closest('[data-act]');
+        if (!el) return;
+        if (el.dataset.act === 'cancel') closeLayer();
+        if (el.dataset.act === 'ok') await run();
+      });
+    },
+  });
+}
+
+/* --- API-токены --- */
+
+const SCOPE_LABELS = { read: 'только чтение', write: 'чтение и запись' };
+
+function paintTokens(box, items) {
+  if (!items.length) {
+    box.innerHTML = `<p class="muted" style="font-size:12.5px">
+      Токенов пока нет. Они нужны для скриптов, мониторинга и CI —
+      запросы идут с заголовком <code class="mono">Authorization: Bearer dfx_…</code>.</p>`;
+    return;
+  }
+  box.innerHTML = `
+    <table class="table">
+      <thead><tr><th>Название</th><th>Доступ</th><th>Создан</th><th>Использован</th><th>Истекает</th><th></th></tr></thead>
+      <tbody>
+        ${items.map((item) => `<tr>
+          <td><div class="cell-main">${esc(item.name)}</div>
+            <div class="cell-sub mono">${esc(item.prefix)}…</div></td>
+          <td><span class="chip ${item.scope === 'write' ? 'accent' : ''}">${esc(SCOPE_LABELS[item.scope] || item.scope)}</span></td>
+          <td class="mono" style="font-size:11.5px">${esc(stamp(item.created_at))}</td>
+          <td class="mono" style="font-size:11.5px">${item.last_used_at ? esc(stamp(item.last_used_at)) : '—'}</td>
+          <td class="mono" style="font-size:11.5px">${item.expires_at ? esc(stamp(item.expires_at)) : 'бессрочно'}</td>
+          <td class="num"><button class="icon-btn" data-token="${item.id}" title="Удалить">${icon('trash')}</button></td>
+        </tr>`).join('')}
+      </tbody>
+    </table>
+    <p class="muted" style="font-size:12px;margin-top:12px">
+      Токен с доступом «только чтение» может выполнять лишь GET-запросы к API.
+      Полное значение токена показывается один раз при создании.
+    </p>`;
+}
+
+async function hydrateTokens(container) {
+  const box = container.querySelector('#token-list');
+  if (!box) return;
+  try {
+    const data = await api('/api/tokens');
+    paintTokens(box, data.items || []);
+    bind(box, 'click', async (ev) => {
+      const btn = ev.target.closest('[data-token]');
+      if (!btn) return;
+      const ok = await confirmDialog({
+        title: 'Удалить токен?',
+        text: 'Скрипты, использующие этот токен, потеряют доступ к API.',
+        confirmText: 'Удалить', danger: true,
+      });
+      if (!ok) return;
+      try {
+        await api(`/api/tokens/${btn.dataset.token}`, { method: 'DELETE' });
+        toast('Токен удалён');
+        hydrateTokens(container);
+      } catch (err) { toast(err.message, 'err'); }
+    });
+  } catch (err) {
+    box.innerHTML = `<div class="notice warn">${esc(err.message)}</div>`;
+  }
+}
+
+function openTokenCreate(container) {
+  openModal({
+    title: 'Новый API-токен',
+    body: `
+      <div class="form-grid">
+        <div class="field full">
+          <label>Название</label>
+          <input class="input" name="name" placeholder="Мониторинг / бэкап / CI">
+        </div>
+        <div class="field">
+          <label>Уровень доступа</label>
+          <select class="input" name="scope">
+            <option value="read">Только чтение (GET)</option>
+            <option value="write">Чтение и запись</option>
+          </select>
+        </div>
+        <div class="field">
+          <label>Срок действия, дней</label>
+          <input class="input" name="expires_days" type="number" min="0" max="3650" value="0">
+          <div class="hint">0 — бессрочно</div>
+        </div>
+      </div>
+      <div class="login-error" id="token-error"></div>`,
+    footer: `<button class="btn" data-act="cancel">Отмена</button>
+      <button class="btn btn-primary" data-act="create">Создать</button>`,
+    onMount(modal) {
+      const name = modal.querySelector('[name="name"]');
+      name.focus();
+      const create = async () => {
+        const err = modal.querySelector('#token-error');
+        err.classList.remove('show');
+        try {
+          const result = await api('/api/tokens', {
+            method: 'POST',
+            body: {
+              name: name.value.trim(),
+              scope: modal.querySelector('[name="scope"]').value,
+              expires_days: Number(modal.querySelector('[name="expires_days"]').value || 0),
+            },
+          });
+          closeLayer();
+          hydrateTokens(container);
+          openModal({
+            title: 'Токен создан',
+            body: `
+              <div class="notice warn" style="margin-bottom:14px">${icon('alert')}
+                <div>Скопируйте токен сейчас — второй раз он не покажется.</div></div>
+              <div class="sub-url-row">
+                <input class="input mono" value="${esc(result.token)}" readonly onclick="this.select()">
+                <button class="icon-btn" data-act="copy" title="Копировать">${icon('copy')}</button>
+              </div>
+              <div class="code-block" style="margin-top:12px">curl -H "Authorization: Bearer ${esc(result.token)}" \\
+  ${esc(settingsBase())}/api/users</div>`,
+            footer: `<button class="btn btn-primary" data-act="close">Готово</button>`,
+            onMount(box) {
+              box.addEventListener('click', async (ev) => {
+                const el = ev.target.closest('[data-act]');
+                if (!el) return;
+                if (el.dataset.act === 'copy') await copy(result.token, 'Токен скопирован');
+                if (el.dataset.act === 'close') closeLayer();
+              });
+            },
+          });
+        } catch (error) {
+          err.textContent = error.message;
+          err.classList.add('show');
+        }
+      };
+      name.addEventListener('keydown', (ev) => { if (ev.key === 'Enter') { ev.preventDefault(); create(); } });
+      modal.addEventListener('click', async (ev) => {
+        const el = ev.target.closest('[data-act]');
+        if (!el) return;
+        if (el.dataset.act === 'cancel') closeLayer();
+        if (el.dataset.act === 'create') await create();
+      });
+    },
+  });
+}
+
+function settingsBase() {
+  const settings = state.settings || {};
+  return (settings.public_base_url || settings.base_url || window.location.origin).replace(/\/$/, '');
+}
+
+/* --- уведомления --- */
+
+const EVENT_LABELS = {
+  node_offline: 'Сервер не в сети',
+  node_recovered: 'Сервер вернулся в строй',
+  user_limit: 'Клиент исчерпал лимит',
+  update_available: 'Доступна новая версия',
+};
+
+function paintNotifications(box, data) {
+  const events = data.events || [];
+  box.innerHTML = `
+    <div class="card-head">
+      <div><h3>Уведомления</h3>
+        <div class="hint">Куда и о чём панель сообщает сама.</div></div>
+      <div class="spacer"></div>
+      <span class="chip ${data.enabled ? 'mint' : 'chip-quiet'}">${data.enabled ? 'включены' : 'выключены'}</span>
+    </div>
+    <div class="card-body">
+      ${sw('notify_enabled', 'Отправлять уведомления', data.enabled,
+           'Telegram-бот и/или webhook. Проверка событий — раз в 90 секунд, повторы не спамят.')}
+      <div class="form-grid" style="margin-top:14px">
+        <div class="field">
+          <label>Токен Telegram-бота</label>
+          <input class="input mono" name="telegram_token" value="${esc(data.telegram_token || '')}" placeholder="123456:AA…">
+          <div class="hint">Создайте бота у <code class="mono">@BotFather</code>.</div>
+        </div>
+        <div class="field">
+          <label>Chat ID</label>
+          <input class="input mono" name="telegram_chat" value="${esc(data.telegram_chat || '')}" placeholder="-1001234567890">
+        </div>
+        <div class="field full">
+          <label>Webhook</label>
+          <input class="input mono" name="webhook" value="${esc(data.webhook || '')}" placeholder="https://hooks.example.com/dfxray">
+          <div class="hint">POST c JSON <code class="mono">{event, title, text, panel, time}</code>.</div>
+        </div>
+      </div>
+      <div class="field" style="margin-top:14px">
+        <label>События</label>
+        <div class="event-grid">
+          ${Object.entries(data.available_events || {}).map(([name, label]) => `
+            <label class="switch">
+              <input type="checkbox" class="notify-event" value="${esc(name)}" ${events.includes(name) ? 'checked' : ''}>
+              <span class="track"></span><span class="label">${esc(label || EVENT_LABELS[name] || name)}</span>
+            </label>`).join('')}
+        </div>
+      </div>
+      <div style="display:flex;gap:8px;margin-top:18px;flex-wrap:wrap">
+        <button class="btn btn-primary" type="button" data-act="notify-save">${icon('check')}Сохранить</button>
+        <button class="btn" type="button" data-act="notify-test">${icon('bolt')}Тестовое сообщение</button>
+        <button class="btn btn-ghost" type="button" data-act="notify-check">${icon('refresh')}Проверить события сейчас</button>
+      </div>
+    </div>`;
+  bind(box, 'click', async (ev) => {
+    const el = ev.target.closest('[data-act]');
+    if (!el) return;
+    const val = (name) => (box.querySelector(`[name="${name}"]`) || {}).value || '';
+    try {
+      if (el.dataset.act === 'notify-save') {
+        await api('/api/notifications', {
+          method: 'PATCH',
+          body: {
+            enabled: box.querySelector('[name="notify_enabled"]').checked,
+            telegram_token: val('telegram_token').trim(),
+            telegram_chat: val('telegram_chat').trim(),
+            webhook: val('webhook').trim(),
+            events: [...box.querySelectorAll('.notify-event:checked')].map((input) => input.value),
+          },
+        });
+        toast('Уведомления сохранены');
+      } else if (el.dataset.act === 'notify-test') {
+        await api('/api/notifications/test', { method: 'POST' });
+        toast('Тестовое сообщение отправлено');
+      } else if (el.dataset.act === 'notify-check') {
+        const result = await api('/api/notifications/check', { method: 'POST' });
+        toast(result.total ? `Отправлено событий: ${result.total}` : 'Новых событий нет');
+      }
+    } catch (err) { toast(err.message, 'err'); }
+  });
+}
+
+async function hydrateNotifications(container) {
+  const box = container.querySelector('#notify-card');
+  if (!box) return;
+  try {
+    paintNotifications(box, await api('/api/notifications'));
+  } catch (err) {
+    box.innerHTML = `<div class="card-body"><div class="notice warn">${esc(err.message)}</div></div>`;
   }
 }

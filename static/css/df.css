@@ -992,3 +992,21 @@ tr:hover .row-actions { opacity: 1; }
   flex: 1; margin: 0; white-space: pre-wrap; word-break: break-all;
   max-height: 220px; overflow: auto; font-size: 12px; line-height: 1.6;
 }
+
+/* --- 2FA, API-токены, уведомления --- */
+.totp-setup { display: flex; gap: 18px; align-items: flex-start; flex-wrap: wrap; }
+.totp-setup > div:last-child { flex: 1 1 260px; min-width: 220px; }
+.totp-qr {
+  flex: 0 0 auto; background: #fff; border-radius: 12px; padding: 10px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, .25); line-height: 0;
+}
+.totp-qr svg { width: 168px; height: 168px; display: block; }
+.recovery-grid {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(112px, 1fr)); gap: 8px;
+}
+.recovery-grid code {
+  display: block; text-align: center; padding: 8px 6px; font-size: 12.5px; letter-spacing: .06em;
+  border-radius: 8px; border: 1px dashed var(--line-strong); background: var(--panel-2);
+}
+.event-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 8px 18px; margin-top: 6px; }
+#token-list .table td { vertical-align: middle; }

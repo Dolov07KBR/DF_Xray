@@ -43,7 +43,7 @@ LOG_LEVEL = os.environ.get("DFX_LOG_LEVEL", "info").lower()
 
 STOP = False
 
-AGENT_VERSION = "1.2.0"
+AGENT_VERSION = "1.3.0"
 APPLIED_REVISION = ""
 LAST_ERROR = ""
 

@@ -19,7 +19,7 @@ os.environ["DFX_ADMIN_USERNAME"] = "admin"
 os.environ["DFX_ADMIN_PASSWORD"] = "sup3r-secret-pass"
 os.environ["DFX_SEED_DEMO"] = "0"
 
-from app import config, db, seed
+from app import config, db, seed, totp
 from app.server import Handler, PanelHTTPServer
 
 
@@ -627,6 +627,200 @@ class PanelTestCase(unittest.TestCase):
         self.assertFalse(updated["enabled"])
         self.assertEqual(updated["health"], "disabled")
         self.json_request("DELETE", f"/api/nodes/{created['id']}")
+
+    # --- 2FA, API-токены, уведомления, drain и миграция ---
+
+    def test_totp_login_flow(self):
+        self.login()
+        try:
+            status, _, before = self.json_request("GET", "/api/account/2fa")
+            self.assertEqual(status, 200)
+            self.assertFalse(before["enabled"])
+
+            status, _, start = self.json_request("POST", "/api/account/2fa/start")
+            self.assertEqual(status, 200, start)
+            self.assertTrue(start["secret"])
+            self.assertIn("otpauth://", start["uri"])
+            self.assertIn("<svg", start["qr_svg"])
+            recovery = start["recovery_codes"]
+            self.assertEqual(len(recovery), 8)
+
+            status, _, bad = self.json_request(
+                "POST", "/api/account/2fa/enable", {"code": "000000"}
+            )
+            self.assertEqual(status, 400, bad)
+
+            status, _, enabled = self.json_request(
+                "POST", "/api/account/2fa/enable", {"code": totp.code(start["secret"])}
+            )
+            self.assertEqual(status, 200, enabled)
+            self.assertTrue(enabled["enabled"])
+
+            # Вход без кода: пароль принят, но нужен второй фактор.
+            other = http.cookiejar.CookieJar()
+            opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(other))
+            status, _, step = self.json_request(
+                "POST",
+                "/api/auth/login",
+                {"username": "admin", "password": "sup3r-secret-pass"},
+                opener=opener,
+            )
+            self.assertEqual(status, 200, step)
+            self.assertTrue(step["totp_required"])
+            self.assertFalse(any(cookie.name == "dfx_session" for cookie in other))
+
+            status, _, wrong = self.json_request(
+                "POST",
+                "/api/auth/login",
+                {"username": "admin", "challenge": step["challenge"], "code": "000000"},
+                opener=opener,
+            )
+            self.assertEqual(status, 401, wrong)
+
+            # Резервный код одноразовый.
+            status, _, ok = self.json_request(
+                "POST",
+                "/api/auth/login",
+                {"username": "admin", "challenge": step["challenge"], "code": recovery[0]},
+                opener=opener,
+            )
+            self.assertEqual(status, 200, ok)
+            self.assertTrue(any(cookie.name == "dfx_session" for cookie in other))
+
+            status, _, again = self.json_request(
+                "POST",
+                "/api/auth/login",
+                {"username": "admin", "challenge": step["challenge"], "code": recovery[0]},
+                opener=opener,
+            )
+            self.assertEqual(status, 401, again)
+
+            status, _, disabled = self.json_request(
+                "POST", "/api/account/2fa/disable", {"password": "sup3r-secret-pass"}, opener=opener
+            )
+            self.assertEqual(status, 200, disabled)
+            self.assertFalse(disabled["enabled"])
+            # После выключения 2FA вход снова ограничивается паролем.
+            status, _, relogin = self.json_request(
+                "POST",
+                "/api/auth/login",
+                {"username": "admin", "password": "sup3r-secret-pass"},
+                opener=opener,
+            )
+            self.assertEqual(status, 200, relogin)
+            self.assertFalse(relogin.get("totp_required", False))
+        finally:
+            db.run(
+                "UPDATE admins SET totp_enabled = 0, totp_secret = NULL, totp_recovery = NULL "
+                "WHERE username = 'admin'"
+            )
+            db.run("DELETE FROM sessions")
+            db.run("DELETE FROM login_challenges")
+
+    def test_api_tokens_scope(self):
+        self.login()
+        status, _, created = self.json_request(
+            "POST", "/api/tokens", {"name": "monitor", "scope": "read"}
+        )
+        self.assertEqual(status, 201, created)
+        self.assertTrue(created["token"].startswith("dfx_"))
+
+        bare = urllib.request.build_opener()
+        status, _, users = self.json_request(
+            "GET", "/api/users", headers={"Authorization": f"Bearer {created['token']}"}, opener=bare
+        )
+        self.assertEqual(status, 200, users)
+
+        status, _, denied = self.json_request(
+            "POST",
+            "/api/users",
+            {"username": "token-user"},
+            headers={"Authorization": f"Bearer {created['token']}"},
+            opener=bare,
+        )
+        self.assertEqual(status, 403, denied)
+
+        status, _, listing = self.json_request("GET", "/api/tokens")
+        self.assertTrue(any(item["id"] == created["id"] for item in listing["items"]))
+
+        status, _, removed = self.json_request("DELETE", f"/api/tokens/{created['id']}")
+        self.assertEqual(status, 200, removed)
+        status, _, revoked = self.json_request(
+            "GET", "/api/users", headers={"Authorization": f"Bearer {created['token']}"}, opener=bare
+        )
+        self.assertEqual(status, 401, revoked)
+
+        status, _, bad = self.json_request(
+            "POST", "/api/tokens", {"name": "x", "scope": "root"}
+        )
+        self.assertEqual(status, 400, bad)
+
+    def test_notifications_settings(self):
+        self.login()
+        status, _, data = self.json_request("GET", "/api/notifications")
+        self.assertEqual(status, 200)
+        self.assertIn("node_offline", data["available_events"])
+
+        status, _, saved = self.json_request(
+            "PATCH",
+            "/api/notifications",
+            {"enabled": True, "telegram_chat": "42", "events": ["node_offline", "node_recovered"]},
+        )
+        self.assertEqual(status, 200, saved)
+        self.assertTrue(saved["enabled"])
+        self.assertEqual(sorted(saved["events"]), ["node_offline", "node_recovered"])
+
+        status, _, bad = self.json_request(
+            "PATCH", "/api/notifications", {"events": ["nope"]}
+        )
+        self.assertEqual(status, 400, bad)
+
+        status, _, check = self.json_request("POST", "/api/notifications/check")
+        self.assertEqual(status, 200, check)
+        self.assertIn("total", check)
+
+        self.json_request("PATCH", "/api/notifications", {"enabled": False, "events": []})
+
+    def test_node_drain_hides_links(self):
+        self.login()
+        status, _, user = self.json_request(
+            "POST", "/api/users", {"username": "drain-check", "node_ids": "1", "days": 30}
+        )
+        self.assertEqual(status, 201, user)
+        status, _, plain = self.request("GET", f"/sub/{user['sub_token']}")
+        self.assertEqual(status, 200)
+        self.assertIn(base64.b64decode(plain).decode("utf-8").count("vless"), [1])
+
+        status, _, drained = self.json_request("POST", "/api/nodes/1/drain", {"drain": True})
+        self.assertEqual(status, 200, drained.get("id"))
+        status, _, empty = self.request("GET", f"/sub/{user['sub_token']}")
+        self.assertEqual(status, 200)
+        self.assertEqual(base64.b64decode(empty).decode("utf-8").strip(), "")
+
+        status, _, back = self.json_request("POST", "/api/nodes/1/drain", {"drain": False})
+        self.assertEqual(status, 200)
+        status, _, restored = self.request("GET", f"/sub/{user['sub_token']}")
+        self.assertGreaterEqual(base64.b64decode(restored).decode("utf-8").count("vless"), 1)
+        self.json_request("DELETE", f"/api/users/{user['id']}")
+
+    def test_node_migrate_moves_clients(self):
+        self.login()
+        status, _, user = self.json_request(
+            "POST", "/api/users", {"username": "migrate-check", "node_ids": "1", "days": 30}
+        )
+        self.assertEqual(status, 201, user)
+        status, _, result = self.json_request(
+            "POST", "/api/nodes/1/migrate", {"to_node_id": 2}
+        )
+        self.assertEqual(status, 200, result)
+        self.assertGreaterEqual(result["moved"], 1)
+
+        status, _, fresh = self.json_request("GET", f"/api/users/{user['id']}")
+        self.assertEqual(fresh["node_ids"], [2])
+
+        status, _, same = self.json_request("POST", "/api/nodes/1/migrate", {"to_node_id": 1})
+        self.assertEqual(status, 400, same)
+        self.json_request("DELETE", f"/api/users/{user['id']}")
 
 
 if __name__ == "__main__":

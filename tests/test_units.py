@@ -389,6 +389,7 @@ class MigrationTests(unittest.TestCase):
             """
             CREATE TABLE users (id INTEGER PRIMARY KEY);
             CREATE TABLE groups (id INTEGER PRIMARY KEY);
+            CREATE TABLE admins (id INTEGER PRIMARY KEY, username TEXT);
             CREATE TABLE nodes (id INTEGER PRIMARY KEY, name TEXT);
             CREATE TABLE traffic (user_id INTEGER, node_id INTEGER, day TEXT, up INTEGER, down INTEGER);
             INSERT INTO nodes (name) VALUES ('old node');
@@ -397,7 +398,31 @@ class MigrationTests(unittest.TestCase):
         db._migrate(conn)
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(nodes)")}
         for expected in ("region", "install_token", "agent_version", "xray_running",
-                         "uptime_seconds", "load1", "cfg_revision", "last_error"):
+                         "uptime_seconds", "load1", "cfg_revision", "last_error", "drain"):
             self.assertIn(expected, columns)
+        admin_columns = {row["name"] for row in conn.execute("PRAGMA table_info(admins)")}
+        self.assertIn("totp_secret", admin_columns)
         token = conn.execute("SELECT install_token FROM nodes").fetchone()[0]
         self.assertTrue(token)
+
+
+class LatencyTest(unittest.TestCase):
+    def test_sort_links_orders_by_latency(self):
+        from app import latency
+
+        latency.reset_cache()
+        links = [
+            {"node_id": 1, "node_name": "far"},
+            {"node_id": 2, "node_name": "near"},
+            {"node_id": 3, "node_name": "down"},
+        ]
+        result = latency.sort_links(links, {1: 120.0, 2: 15.5, 3: None})
+        self.assertEqual([item["node_name"] for item in result], ["near", "far", "down"])
+        self.assertEqual(result[0]["latency_ms"], 15.5)
+        self.assertIsNone(result[2]["latency_ms"])
+
+    def test_measure_caches_results(self):
+        from app import latency
+
+        latency.reset_cache()
+        self.assertEqual(latency.measure([]), {})

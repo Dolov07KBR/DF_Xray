@@ -10,7 +10,7 @@ from typing import Any
 
 from . import config
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS settings (
@@ -19,12 +19,35 @@ CREATE TABLE IF NOT EXISTS settings (
 );
 
 CREATE TABLE IF NOT EXISTS admins (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    username      TEXT NOT NULL UNIQUE,
-    password_hash TEXT NOT NULL,
-    created_at    TEXT NOT NULL,
-    last_login_at TEXT,
-    last_login_ip TEXT
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    username          TEXT NOT NULL UNIQUE,
+    password_hash     TEXT NOT NULL,
+    totp_secret       TEXT,
+    totp_enabled      INTEGER NOT NULL DEFAULT 0,
+    totp_recovery     TEXT,
+    totp_confirmed_at TEXT,
+    created_at        TEXT NOT NULL,
+    last_login_at     TEXT,
+    last_login_ip     TEXT
+);
+
+CREATE TABLE IF NOT EXISTS login_challenges (
+    token_hash TEXT PRIMARY KEY,
+    admin_id   INTEGER NOT NULL REFERENCES admins(id) ON DELETE CASCADE,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS api_tokens (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    name         TEXT NOT NULL,
+    prefix       TEXT NOT NULL,
+    token_hash   TEXT NOT NULL UNIQUE,
+    scope        TEXT NOT NULL DEFAULT 'read',
+    created_by   TEXT NOT NULL DEFAULT '',
+    created_at   TEXT NOT NULL,
+    last_used_at TEXT,
+    expires_at   TEXT
 );
 
 CREATE TABLE IF NOT EXISTS sessions (
@@ -182,6 +205,16 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "update_notes": "",
     "update_command": "",
     "install_dir": "/opt/dfxray",
+    # подписка
+    "sub_sort_by_latency": "1",
+    # уведомления
+    "notify_enabled": "0",
+    "notify_telegram_token": "",
+    "notify_telegram_chat": "",
+    "notify_webhook": "",
+    "notify_events": "node_offline,user_limit,update_available",
+    "notify_state": "{}",
+    "acme_email": "",
 }
 
 
@@ -289,6 +322,21 @@ def _migrate(conn: sqlite3.Connection) -> None:
             "ALTER TABLE users ADD COLUMN group_id INTEGER "
             "REFERENCES groups(id) ON DELETE SET NULL"
         )
+
+    # v4: 2FA, API-токены, drain серверов.
+    admin_columns = {row["name"] for row in conn.execute("PRAGMA table_info(admins)")}
+    for name, ddl in {
+        "totp_secret": "TEXT",
+        "totp_enabled": "INTEGER NOT NULL DEFAULT 0",
+        "totp_recovery": "TEXT",
+        "totp_confirmed_at": "TEXT",
+    }.items():
+        if name not in admin_columns:
+            conn.execute(f"ALTER TABLE admins ADD COLUMN {name} {ddl}")
+    node_columns = {row["name"] for row in conn.execute("PRAGMA table_info(nodes)")}
+    for name, ddl in {"drain": "INTEGER NOT NULL DEFAULT 0", "drained_at": "TEXT"}.items():
+        if name not in node_columns:
+            conn.execute(f"ALTER TABLE nodes ADD COLUMN {name} {ddl}")
 
     # v3: метрики агента и токен установки для мультисерверной панели.
     node_columns = {row["name"] for row in conn.execute("PRAGMA table_info(nodes)")}

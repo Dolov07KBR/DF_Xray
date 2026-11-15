@@ -200,6 +200,7 @@ const P = {
   calendar: '<rect x="3" y="5" width="18" height="16" rx="2"/><path d="M8 3v4M16 3v4M3 11h18"/>',
   arrowUp: '<path d="M12 19V5"/><path d="M5 12l7-7 7 7"/>',
   arrowDown: '<path d="M12 5v14"/><path d="M19 12l-7 7-7-7"/>',
+  bell: '<path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/>',
   eye: '<path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7-10-7-10-7z"/><circle cx="12" cy="12" r="3"/>',
 };
 
