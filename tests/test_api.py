@@ -4,82 +4,23 @@ from __future__ import annotations
 
 import base64
 import http.cookiejar
-import json
-import os
-import shutil
-import tempfile
-import threading
 import unittest
 import urllib.error
 import urllib.request
 
-TMP_DIR = tempfile.mkdtemp(prefix="dfxray-tests-")
-os.environ["DFX_DATA_DIR"] = TMP_DIR
-os.environ["DFX_ADMIN_USERNAME"] = "admin"
-os.environ["DFX_ADMIN_PASSWORD"] = "sup3r-secret-pass"
-os.environ["DFX_SEED_DEMO"] = "0"
+from harness import PanelHarness  # сначала стенд: он выставляет DFX_* переменные
 
-from app import config, db, seed, totp
-from app.server import Handler, PanelHTTPServer
+from app import config, db, totp
 
 
-class PanelTestCase(unittest.TestCase):
-    server: PanelHTTPServer
-    port: int
+def node_inbound(config_data):
+    for inbound in config_data["inbounds"]:
+        if str(inbound.get("tag", "")).startswith("node-"):
+            return inbound
+    raise AssertionError("в конфиге нет inbound ноды")
 
-    @classmethod
-    def setUpClass(cls) -> None:
-        config.ensure_dirs()
-        db.init()
-        seed.run(demo=True)
-        cls.server = PanelHTTPServer(("127.0.0.1", 0), Handler)
-        cls.port = cls.server.server_address[1]
-        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
-        cls.thread.start()
 
-    @classmethod
-    def tearDownClass(cls) -> None:
-        cls.server.shutdown()
-        cls.server.server_close()
-        shutil.rmtree(TMP_DIR, ignore_errors=True)
-
-    def setUp(self) -> None:
-        self.jar = http.cookiejar.CookieJar()
-        self.opener = urllib.request.build_opener(
-            urllib.request.HTTPCookieProcessor(self.jar)
-        )
-
-    # --- helpers ---
-
-    def request(self, method: str, path: str, payload=None, headers=None, opener=None):
-        url = f"http://127.0.0.1:{self.port}{path}"
-        data = None
-        request_headers = {"X-Requested-With": "DF_Xray"}
-        if payload is not None:
-            data = json.dumps(payload).encode("utf-8")
-            request_headers["Content-Type"] = "application/json"
-        if headers:
-            request_headers.update(headers)
-        request = urllib.request.Request(url, data=data, headers=request_headers, method=method)
-        try:
-            with (opener or self.opener).open(request, timeout=15) as response:
-                body = response.read()
-                return response.status, dict(response.headers), body
-        except urllib.error.HTTPError as exc:
-            return exc.code, dict(exc.headers), exc.read()
-
-    def json_request(self, method: str, path: str, payload=None, headers=None, opener=None):
-        status, response_headers, body = self.request(method, path, payload, headers, opener)
-        data = json.loads(body.decode("utf-8")) if body else None
-        return status, response_headers, data
-
-    def login(self, username="admin", password="sup3r-secret-pass"):
-        status, headers, data = self.json_request(
-            "POST", "/api/auth/login", {"username": username, "password": password}
-        )
-        self.assertEqual(status, 200, data)
-        return data
-
+class PanelTestCase(PanelHarness):
     # --- tests ---
 
     def test_health(self):
@@ -203,13 +144,12 @@ class PanelTestCase(unittest.TestCase):
         status, _, node = self.json_request("GET", "/api/nodes/1")
         self.assertEqual(status, 200)
         config_data = node["config"]
-        tags = [inbound["tag"] for inbound in config_data["inbounds"]]
-        self.assertIn("api", tags)
-        node_inbound = config_data["inbounds"][1]
-        self.assertEqual(node_inbound["protocol"], "vless")
-        self.assertEqual(node_inbound["streamSettings"]["security"], "reality")
-        self.assertIn("privateKey", node_inbound["streamSettings"]["realitySettings"])
-        self.assertTrue(node_inbound["settings"]["clients"])
+        self.assertTrue(config_data["api"]["listen"].startswith("127.0.0.1:"))
+        node_inbound_cfg = node_inbound(config_data)
+        self.assertEqual(node_inbound_cfg["protocol"], "vless")
+        self.assertEqual(node_inbound_cfg["streamSettings"]["security"], "reality")
+        self.assertIn("privateKey", node_inbound_cfg["streamSettings"]["realitySettings"])
+        self.assertTrue(node_inbound_cfg["settings"]["clients"])
         self.assertTrue(config_data["api"]["services"])
         self.assertTrue(
             any(rule.get("protocol") == ["bittorrent"] for rule in config_data["routing"]["rules"])
@@ -261,7 +201,7 @@ class PanelTestCase(unittest.TestCase):
         )
         emails = [
             client["email"]
-            for client in config_response["config"]["inbounds"][1]["settings"]["clients"]
+            for client in node_inbound(config_response["config"])["settings"]["clients"]
         ]
         self.assertNotIn("limited_by_agent", emails)
 

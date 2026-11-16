@@ -540,6 +540,17 @@ tr:hover .row-actions { opacity: 1; }
 .settings-nav button:hover { background: rgba(255, 255, 255, .04); color: var(--text); }
 .settings-nav button.active { background: var(--grad-soft); border-color: rgba(124, 92, 255, .25); color: #fff; }
 .settings-nav svg { width: 15px; height: 15px; opacity: .8; }
+.settings-nav-caption {
+  font-size: 10px; letter-spacing: .09em; text-transform: uppercase; color: var(--muted);
+  padding: 12px 11px 4px; font-weight: 650;
+}
+.settings-nav-caption:first-child { padding-top: 4px; }
+
+.bot-stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
+.bot-stat { background: var(--panel-2); border: 1px solid var(--line); border-radius: 11px; padding: 11px 13px; }
+.bot-stat span { display: block; font-size: 10px; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); margin-bottom: 4px; }
+.bot-stat b { font-size: 17px; font-variant-numeric: tabular-nums; }
+@media (max-width: 720px) { .bot-stats { grid-template-columns: repeat(2, 1fr); } }
 
 .kv { display: flex; justify-content: space-between; gap: 14px; padding: 9px 0; border-bottom: 1px solid rgba(31, 40, 57, .6); font-size: 13px; }
 .kv:last-child { border-bottom: 0; }
@@ -1054,3 +1065,28 @@ tr:hover .row-actions { opacity: 1; }
 .sni-add .input { flex: 1; }
 .sni-panel .table tr.active td { background: rgba(124, 92, 255, .1); }
 .sni-panel .table tr.active .cell-main { color: var(--accent); }
+
+/* --- метрики железа на дашборде --- */
+.metric-now { font-size: 22px; font-weight: 700; letter-spacing: -.02em; }
+.metric-now small { font-size: 12px; color: var(--muted); font-weight: 600; margin-left: 1px; }
+.percent-chart { display: block; width: 100%; }
+.chart-empty {
+  display: flex; align-items: center; justify-content: center; height: 140px;
+  color: var(--muted); font-size: 12px; border: 1px dashed var(--line); border-radius: 10px;
+}
+
+/* --- разделы панели внутри настроек --- */
+.service-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 10px; }
+.service-card {
+  display: flex; flex-direction: column; gap: 4px; padding: 14px 15px;
+  border: 1px solid var(--line); border-radius: 12px; background: var(--panel-2);
+  color: var(--text); text-decoration: none; transition: border-color .15s, transform .15s;
+}
+.service-card:hover { border-color: var(--line-strong); transform: translateY(-1px); text-decoration: none; }
+.service-card b { font-size: 13px; }
+.service-card .muted { font-size: 11.5px; line-height: 1.45; }
+.service-ico {
+  width: 30px; height: 30px; border-radius: 9px; display: grid; place-items: center;
+  background: rgba(124, 92, 255, .14); color: #b9a9ff; margin-bottom: 4px;
+}
+.service-ico svg { width: 16px; height: 16px; }

@@ -2,18 +2,33 @@
 
 import {
   api, bind, closeLayer, confirmDialog, copy, esc, formChecked, formValue, icon,
-  openModal, state, toast,
+  openModal, relTime, state, toast,
 } from '../core.js';
 
 const SECTIONS = [
-  { id: 'general', label: 'Общие', icon: 'settings' },
-  { id: 'subscription', label: 'Подписки', icon: 'link' },
-  { id: 'notifications', label: 'Уведомления', icon: 'bell' },
-  { id: 'security', label: 'Безопасность', icon: 'shield' },
-  { id: 'update', label: 'Обновление', icon: 'refresh' },
-  { id: 'maintenance', label: 'Обслуживание', icon: 'download' },
-  { id: 'about', label: 'О панели', icon: 'info' },
+  { id: 'general', label: 'Общие', icon: 'settings', group: 'Панель' },
+  { id: 'services', label: 'Разделы панели', icon: 'grid', group: 'Панель' },
+  { id: 'subscription', label: 'Подписки', icon: 'link', group: 'Панель' },
+  { id: 'bot', label: 'Telegram-бот', icon: 'send', group: 'Продажи' },
+  { id: 'notifications', label: 'Уведомления', icon: 'bell', group: 'Система' },
+  { id: 'security', label: 'Безопасность', icon: 'shield', group: 'Система' },
+  { id: 'update', label: 'Обновление', icon: 'refresh', group: 'Система' },
+  { id: 'maintenance', label: 'Обслуживание', icon: 'download', group: 'Система' },
+  { id: 'about', label: 'О панели', icon: 'info', group: 'Система' },
 ];
+
+function sectionsNavHtml() {
+  let group = '';
+  return SECTIONS.map((section) => {
+    const caption = section.group !== group
+      ? `<div class="settings-nav-caption">${section.group}</div>`
+      : '';
+    group = section.group;
+    return `${caption}<button data-section="${section.id}" class="${activeSection === section.id ? 'active' : ''}">
+                ${icon(section.icon)}${section.label}
+              </button>`;
+  }).join('');
+}
 
 function sectionFromHash() {
   const query = window.location.hash.split('?')[1] || '';
@@ -33,7 +48,45 @@ function sw(name, label, checked, hint = '') {
   </div>`;
 }
 
+const PANEL_LINKS = [
+  ['#/inbounds', 'Входящие', 'Протоколы, транспорт и маскировка нод', 'inbox'],
+  ['#/groups', 'Группы', 'Объединения клиентов для фильтров', 'layers'],
+  ['#/hosts', 'Хосты', 'Домены-маски и их проверка', 'globe'],
+  ['#/outbounds', 'Исходящие', 'SOCKS / HTTP / direct / block в конфиге', 'upload'],
+  ['#/routing', 'Маршрутизация', 'Правила Xray, DNS и основной исходящий', 'route'],
+  ['#/xray', 'Конфигурации Xray', 'Конфиг ноды и Reality-ключи', 'terminal'],
+  ['#/nodes?tab=agents', 'Агенты нод', 'Heartbeat, версии и метрики серверов', 'server'],
+  ['#/audit', 'Журнал действий', 'Кто и что менял в панели', 'activity'],
+  ['#/api-docs', 'Документация API', 'Эндпоинты панели и агентов', 'book'],
+];
+
+function servicesHtml() {
+  return `<div class="card">
+    <div class="card-head"><h3>Разделы панели</h3></div>
+    <div class="card-body">
+      <div class="hint" style="margin-bottom:14px">
+        Всё, что раньше занимало боковое меню, живёт здесь — меню остаётся коротким.
+        Командная палитра (<kbd>Ctrl K</kbd>) открывает любой раздел напрямую.
+      </div>
+      <div class="service-grid">
+        ${PANEL_LINKS.map(([href, title, hint, ic]) => `
+          <a class="service-card" href="${href}">
+            <span class="service-ico">${icon(ic)}</span>
+            <b>${title}</b>
+            <span class="muted">${hint}</span>
+          </a>`).join('')}
+      </div>
+    </div>
+  </div>`;
+}
+
 function sectionHtml(id, settings) {
+  if (id === 'services') {
+    return servicesHtml();
+  }
+  if (id === 'bot') {
+    return '<div id="bot-panel"><div class="skeleton" style="height:420px"></div></div>';
+  }
   if (id === 'general') {
     return `<form class="card" data-form="general">
       <div class="card-head"><h3>Общие настройки</h3></div>
@@ -390,10 +443,7 @@ export async function render(container, ctx) {
       <div class="settings-grid">
         <div class="card"><div class="card-body tight" style="padding:8px">
           <div class="settings-nav">
-            ${SECTIONS.map((section) => `
-              <button data-section="${section.id}" class="${activeSection === section.id ? 'active' : ''}">
-                ${icon(section.icon)}${section.label}
-              </button>`).join('')}
+            ${sectionsNavHtml()}
           </div>
         </div></div>
         <div id="settings-panel">${sectionHtml(activeSection, settings)}</div>
@@ -408,6 +458,7 @@ export async function render(container, ctx) {
       hydrateTokens(container);
     }
     if (activeSection === 'notifications') hydrateNotifications(container);
+    if (activeSection === 'bot') hydrateBot(container);
   };
 
   layout();
@@ -949,6 +1000,234 @@ function paintNotifications(box, data) {
         toast(result.total ? `Отправлено событий: ${result.total}` : 'Новых событий нет');
       }
     } catch (err) { toast(err.message, 'err'); }
+  });
+}
+
+/* ------------------------------------------------------- Telegram-бот --- */
+
+function planRowHtml(plan, index) {
+  return `
+    <tr data-plan-row>
+      <td><input class="input" data-plan="title" value="${esc(plan.title || '')}" placeholder="1 месяц"></td>
+      <td><input class="input" data-plan="days" type="number" min="1" value="${Number(plan.days || 30)}"></td>
+      <td><input class="input" data-plan="gb" type="number" min="0" value="${Number(plan.gb || 0)}"></td>
+      <td><input class="input" data-plan="price" type="number" min="0" value="${Number(plan.price || 0)}"></td>
+      <td><input class="input" data-plan="stars" type="number" min="0" value="${Number(plan.stars || plan.price || 0)}"></td>
+      <td><button class="icon-btn" type="button" data-act="plan-del" data-index="${index}" title="Удалить">${icon('trash')}</button></td>
+    </tr>`;
+}
+
+function botHtml(data) {
+  const conf = data.settings || {};
+  const status = data.status || {};
+  const plans = conf.plans || [];
+  const orders = data.orders || [];
+  const mode = conf.payment_mode || 'stars';
+  const statusTone = status.running ? 'mint' : (conf.enabled ? 'warn' : '');
+  const statusText = status.running ? 'работает' : (conf.enabled ? 'остановлен' : 'выключен');
+  return `
+    <div class="card">
+      <div class="card-head">
+        <div>
+          <h3>Telegram-бот продаж</h3>
+          <div class="hint">Бот сам опрашивает Telegram — вебхук и белый IP не нужны.</div>
+        </div>
+        <div class="spacer"></div>
+        <span class="status ${statusTone}"><span class="dot"></span>${statusText}</span>
+      </div>
+      <div class="card-body">
+        <div class="bot-stats">
+          <div class="bot-stat"><span>Клиентов</span><b>${status.clients || 0}</b></div>
+          <div class="bot-stat"><span>Оплат</span><b>${status.paid || 0}</b></div>
+          <div class="bot-stat"><span>Выручка</span><b>${Math.round(status.revenue || 0)} ★</b></div>
+          <div class="bot-stat"><span>Ждут оплаты</span><b>${status.pending || 0}</b></div>
+        </div>
+        <div class="form-grid" style="margin-top:14px">
+          <div class="field full">
+            <label>Токен бота (от @BotFather)</label>
+            <input class="input mono" name="token" type="password" autocomplete="off"
+                   placeholder="${conf.token_set ? `сохранён ${esc(conf.token_hint || '')} — оставьте пустым, чтобы не менять` : '123456789:AA…'}">
+            <div class="hint">Бот: ${conf.username ? `<b>@${esc(conf.username)}</b>` : 'ещё не подключён'}.
+              Создайте бота у @BotFather командой <code class="mono">/newbot</code> и вставьте токен.</div>
+          </div>
+          ${sw('enabled', 'Бот включён', conf.enabled, 'После сохранения бот начнёт принимать сообщения.')}
+          ${sw('trial_enabled', 'Пробный доступ', conf.trial_enabled, 'Одноразовый тест для новых клиентов.')}
+          <div class="field">
+            <label>Пробный период, дней</label>
+            <input class="input" name="trial_days" type="number" min="0" max="90" value="${Number(conf.trial_days || 0)}">
+          </div>
+          <div class="field">
+            <label>Пробный трафик, ГБ</label>
+            <input class="input" name="trial_gb" type="number" min="0" value="${Number(conf.trial_gb || 0)}">
+          </div>
+          <div class="field">
+            <label>Чат администратора</label>
+            <input class="input mono" name="admin_chat" value="${esc(conf.admin_chat || '')}" placeholder="123456789">
+            <div class="hint">Куда присылать заявки и статистику. Узнать id: напишите боту и посмотрите <code class="mono">/stats</code>.</div>
+          </div>
+          <div class="field">
+            <label>Оплата</label>
+            <select class="select" name="payment_mode">
+              <option value="stars" ${mode === 'stars' ? 'selected' : ''}>Telegram Stars (автоматически)</option>
+              <option value="manual" ${mode === 'manual' ? 'selected' : ''}>Вручную (подтверждаю в панели)</option>
+            </select>
+            <div class="hint">Stars не требуют платёжного провайдера: счёт приходит в чат Telegram.</div>
+          </div>
+          <div class="field full">
+            <label>Приветствие</label>
+            <textarea class="textarea" name="welcome" rows="2">${esc(conf.welcome || '')}</textarea>
+          </div>
+          <div class="field">
+            <label>Поддержка (ссылка или текст)</label>
+            <input class="input" name="support" value="${esc(conf.support || '')}" placeholder="https://t.me/support">
+          </div>
+          <div class="field">
+            <label>Текст при ручной оплате</label>
+            <input class="input" name="manual_note" value="${esc(conf.manual_note || '')}"
+                   placeholder="Перевод на карту …">
+          </div>
+        </div>
+
+        <div class="card-head" style="margin-top:18px">
+          <h3 style="font-size:13px">Тарифы</h3>
+          <div class="spacer"></div>
+          <button class="btn btn-sm" type="button" data-act="plan-add">${icon('plus')}Добавить тариф</button>
+        </div>
+        <div class="table-wrap">
+          <table class="table" id="bot-plans">
+            <thead><tr><th>Название</th><th>Дней</th><th>ГБ</th><th>Цена, ₽</th><th>Stars ★</th><th></th></tr></thead>
+            <tbody>${plans.map((plan, index) => planRowHtml(plan, index)).join('') || '<tr><td colspan="6" class="muted">Тарифов нет</td></tr>'}</tbody>
+          </table>
+        </div>
+
+        <div class="actions" style="margin-top:16px">
+          <button class="btn btn-primary" type="button" data-act="bot-save">${icon('check')}Сохранить</button>
+          <button class="btn" type="button" data-act="bot-test">${icon('bolt')}Проверить токен</button>
+          <button class="btn" type="button" data-act="bot-restart">${icon('refresh')}Перезапустить бота</button>
+        </div>
+        ${status.last_error ? `<div class="nc-error" style="margin-top:12px">${icon('alert')}<span>${esc(status.last_error)}</span></div>` : ''}
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-head"><h3>Заказы</h3><div class="spacer"></div>
+        <button class="btn btn-ghost btn-sm" type="button" data-act="bot-orders">${icon('refresh')}Обновить</button>
+      </div>
+      <div class="table-wrap">
+        <table class="table">
+          <thead><tr><th>#</th><th>Клиент</th><th>Тариф</th><th>Период</th><th>Сумма</th><th>Статус</th><th>Когда</th><th></th></tr></thead>
+          <tbody>
+            ${orders.length ? orders.map((order) => `
+              <tr>
+                <td class="mono">${order.id}</td>
+                <td style="white-space:nowrap">${order.username ? `@${esc(order.username)}` : esc(String(order.tg_id))}
+                  ${order.panel_user ? `<div class="muted" style="font-size:11px">${esc(order.panel_user)}</div>` : ''}</td>
+                <td style="white-space:nowrap">${esc(order.title)}</td>
+                <td class="muted" style="white-space:nowrap;font-size:11.5px">${order.days} дн${order.limit_gb ? ` · ${order.limit_gb} ГБ` : ''}</td>
+                <td style="white-space:nowrap">${Math.round(order.amount)} ${order.currency === 'RUB' ? '₽' : '★'}</td>
+                <td>${order.status === 'paid' ? '<span class="status mint"><span class="dot"></span>оплачен</span>'
+                     : order.status === 'denied' ? '<span class="status offline"><span class="dot"></span>отклонён</span>'
+                     : '<span class="status warn"><span class="dot"></span>ожидает</span>'}</td>
+                <td class="muted" style="font-size:11.5px">${relTime(order.paid_at || order.created_at)}</td>
+                <td>${order.status === 'pending' ? `
+                  <button class="btn btn-sm btn-primary" type="button" data-act="order-approve" data-id="${order.id}">Подтвердить</button>
+                  <button class="icon-btn" type="button" data-act="order-deny" data-id="${order.id}" title="Отклонить">${icon('x')}</button>` : ''}</td>
+              </tr>`).join('') : '<tr><td colspan="8" class="muted">Заказов пока нет</td></tr>'}
+          </tbody>
+        </table>
+      </div>
+    </div>`;
+}
+
+function collectPlans(root) {
+  return [...root.querySelectorAll('#bot-plans tbody tr[data-plan-row]')].map((row, index) => {
+    const get = (key) => row.querySelector(`[data-plan="${key}"]`).value;
+    return {
+      id: `p${index + 1}`,
+      title: get('title').trim(),
+      days: Number(get('days') || 30),
+      gb: Number(get('gb') || 0),
+      price: Number(get('price') || 0),
+      stars: Number(get('stars') || get('price') || 0),
+    };
+  }).filter((plan) => plan.title);
+}
+
+async function hydrateBot(container) {
+  const panel = container.querySelector('#bot-panel');
+  if (!panel) return;
+  try {
+    const data = await api('/api/bot');
+    panel.innerHTML = botHtml(data);
+  } catch (err) {
+    panel.innerHTML = `<div class="card"><div class="card-body">Не удалось загрузить бота: ${esc(err.message)}</div></div>`;
+    return;
+  }
+
+  bind(panel, 'click', async (ev) => {
+    const el = ev.target.closest('[data-act]');
+    if (!el) return;
+    const act = el.dataset.act;
+    try {
+      if (act === 'plan-add' || act === 'plan-del') {
+        const body = panel.querySelector('#bot-plans tbody');
+        if (act === 'plan-add') {
+          body.insertAdjacentHTML('beforeend', planRowHtml({ title: '', days: 30, gb: 100, price: 199, stars: 199 }, body.children.length));
+        } else {
+          el.closest('tr').remove();
+        }
+        return;
+      }
+      if (act === 'bot-save') {
+        const body = {
+          token: panel.querySelector('[name="token"]').value.trim(),
+          enabled: panel.querySelector('[name="enabled"]').checked,
+          trial_enabled: panel.querySelector('[name="trial_enabled"]').checked,
+          trial_days: Number(panel.querySelector('[name="trial_days"]').value || 0),
+          trial_gb: Number(panel.querySelector('[name="trial_gb"]').value || 0),
+          admin_chat: panel.querySelector('[name="admin_chat"]').value.trim(),
+          payment_mode: panel.querySelector('[name="payment_mode"]').value,
+          welcome: panel.querySelector('[name="welcome"]').value.trim(),
+          support: panel.querySelector('[name="support"]').value.trim(),
+          manual_note: panel.querySelector('[name="manual_note"]').value.trim(),
+          plans: collectPlans(panel),
+        };
+        el.disabled = true;
+        await api('/api/bot', { method: 'PATCH', body });
+        toast('Настройки бота сохранены');
+        await hydrateBot(container);
+        return;
+      }
+      if (act === 'bot-test') {
+        el.disabled = true;
+        const result = await api('/api/bot/test', { method: 'POST' });
+        toast(`Бот @${result.username} на связи`);
+        await hydrateBot(container);
+        return;
+      }
+      if (act === 'bot-restart') {
+        await api('/api/bot/restart', { method: 'POST' });
+        toast('Бот перезапущен');
+        await hydrateBot(container);
+        return;
+      }
+      if (act === 'bot-orders') {
+        await hydrateBot(container);
+        return;
+      }
+      if (act === 'order-approve' || act === 'order-deny') {
+        const action = act === 'order-approve' ? 'approve' : 'deny';
+        const result = await api(`/api/bot/orders/${el.dataset.id}`, { method: 'POST', body: { action } });
+        toast(action === 'approve'
+          ? `Оплата подтверждена, клиент ${result.access?.username || ''} активен`
+          : 'Заказ отклонён');
+        await hydrateBot(container);
+        return;
+      }
+    } catch (err) {
+      toast(err.message, 'err');
+      el.disabled = false;
+    }
   });
 }
 

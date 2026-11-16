@@ -10,7 +10,7 @@ from typing import Any
 
 from . import config
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS settings (
@@ -96,6 +96,7 @@ CREATE TABLE IF NOT EXISTS nodes (
     load1         REAL NOT NULL DEFAULT 0,
     mem_used      INTEGER NOT NULL DEFAULT 0,
     mem_total     INTEGER NOT NULL DEFAULT 0,
+    cpu           REAL NOT NULL DEFAULT 0,
     cfg_revision  TEXT,
     applied_at    TEXT,
     last_error    TEXT,
@@ -168,11 +169,66 @@ CREATE TABLE IF NOT EXISTS audit (
     created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS node_commands (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    node_id    INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+    command    TEXT NOT NULL,
+    status     TEXT NOT NULL DEFAULT 'pending',
+    result     TEXT NOT NULL DEFAULT '',
+    created_by TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    finished_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS metrics (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    node_id   INTEGER NOT NULL DEFAULT 0,
+    ts        INTEGER NOT NULL,
+    cpu       REAL NOT NULL DEFAULT 0,
+    mem_used  INTEGER NOT NULL DEFAULT 0,
+    mem_total INTEGER NOT NULL DEFAULT 0,
+    load1     REAL NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS bot_users (
+    tg_id      INTEGER PRIMARY KEY,
+    username   TEXT NOT NULL DEFAULT '',
+    full_name  TEXT NOT NULL DEFAULT '',
+    user_id    INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    state      TEXT NOT NULL DEFAULT '',
+    plan_id    TEXT NOT NULL DEFAULT '',
+    trial_used INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    last_seen  TEXT
+);
+
+CREATE TABLE IF NOT EXISTS bot_orders (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    tg_id       INTEGER NOT NULL,
+    username    TEXT NOT NULL DEFAULT '',
+    plan_id     TEXT NOT NULL DEFAULT '',
+    title       TEXT NOT NULL DEFAULT '',
+    amount      REAL NOT NULL DEFAULT 0,
+    currency    TEXT NOT NULL DEFAULT 'XTR',
+    days        INTEGER NOT NULL DEFAULT 0,
+    limit_gb    INTEGER NOT NULL DEFAULT 0,
+    status      TEXT NOT NULL DEFAULT 'pending',
+    user_id     INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    payload     TEXT NOT NULL DEFAULT '',
+    note        TEXT NOT NULL DEFAULT '',
+    created_at  TEXT NOT NULL,
+    paid_at     TEXT
+);
+
 CREATE INDEX IF NOT EXISTS idx_users_enabled ON users(enabled);
 CREATE INDEX IF NOT EXISTS idx_users_expires ON users(expires_at);
 CREATE INDEX IF NOT EXISTS idx_traffic_day ON traffic(day);
 CREATE INDEX IF NOT EXISTS idx_audit_created ON audit(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_sessions_admin ON sessions(admin_id);
+CREATE INDEX IF NOT EXISTS idx_node_commands_node ON node_commands(node_id, id DESC);
+CREATE INDEX IF NOT EXISTS idx_node_commands_status ON node_commands(status);
+CREATE INDEX IF NOT EXISTS idx_metrics_node_ts ON metrics(node_id, ts DESC);
+CREATE INDEX IF NOT EXISTS idx_bot_orders_status ON bot_orders(status, id DESC);
 """
 
 DEFAULT_SETTINGS: dict[str, str] = {
@@ -215,6 +271,21 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "notify_events": "node_offline,user_limit,update_available",
     "notify_state": "{}",
     "acme_email": "",
+    # Telegram-бот для продажи подписок
+    "bot_enabled": "0",
+    "bot_token": "",
+    "bot_username": "",
+    "bot_admin_chat": "",
+    "bot_welcome": "Привет! Здесь можно оформить подписку на VPN за пару минут.",
+    "bot_support": "",
+    "bot_trial_days": "3",
+    "bot_trial_gb": "10",
+    "bot_trial_enabled": "1",
+    "bot_plans": "[]",
+    "bot_payment_mode": "stars",
+    "bot_manual_note": "Оплата переводом: напишите администратору, он подтвердит заказ в панели.",
+    "bot_state": "{}",
+    "bot_last_error": "",
 }
 
 
@@ -226,6 +297,10 @@ def _connect() -> sqlite3.Connection:
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA busy_timeout=15000")
     conn.execute("PRAGMA synchronous=NORMAL")
+    # Ускоряем чтения и сортировки: кэш страниц и временные таблицы в памяти.
+    conn.execute("PRAGMA cache_size=-16000")
+    conn.execute("PRAGMA temp_store=MEMORY")
+    conn.execute("PRAGMA mmap_size=134217728")
     return conn
 
 
@@ -334,6 +409,9 @@ def _migrate(conn: sqlite3.Connection) -> None:
         if name not in admin_columns:
             conn.execute(f"ALTER TABLE admins ADD COLUMN {name} {ddl}")
     node_columns = {row["name"] for row in conn.execute("PRAGMA table_info(nodes)")}
+    for name, ddl in {"cpu": "REAL NOT NULL DEFAULT 0"}.items():
+        if name not in node_columns:
+            conn.execute(f"ALTER TABLE nodes ADD COLUMN {name} {ddl}")
     for name, ddl in {"drain": "INTEGER NOT NULL DEFAULT 0", "drained_at": "TEXT"}.items():
         if name not in node_columns:
             conn.execute(f"ALTER TABLE nodes ADD COLUMN {name} {ddl}")

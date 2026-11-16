@@ -29,7 +29,9 @@ def index(req: Request) -> Response:
 
 @get(r"/static/(?P<path>.+)", auth_required=False)
 def static(req: Request) -> Response:
-    return serve_static(req.params["path"])
+    return serve_static(
+        req.params["path"], req.header("accept-encoding"), req.header("if-none-match")
+    )
 
 
 @get("/favicon.ico", auth_required=False)

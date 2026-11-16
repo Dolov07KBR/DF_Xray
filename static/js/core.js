@@ -202,6 +202,9 @@ const P = {
   arrowDown: '<path d="M12 5v14"/><path d="M19 12l-7 7-7-7"/>',
   bell: '<path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/>',
   eye: '<path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7-10-7-10-7z"/><circle cx="12" cy="12" r="3"/>',
+  send: '<path d="M22 2L11 13"/><path d="M22 2l-7 20-4-9-9-4z"/>',
+  cpu: '<rect x="5" y="5" width="14" height="14" rx="2"/><rect x="9" y="9" width="6" height="6" rx="1"/><path d="M9 2v3M15 2v3M9 19v3M15 19v3M2 9h3M2 15h3M19 9h3M19 15h3"/>',
+  memory: '<rect x="3" y="7" width="18" height="10" rx="2"/><path d="M7 7V4M12 7V4M17 7V4M7 17v3M12 17v3M17 17v3"/>',
 };
 
 export function icon(name, cls = '') {
@@ -502,6 +505,59 @@ export function sparkline(values, { width = 84, height = 26, stroke = '#7c5cff' 
 
 /* -------------------------------------------------------------- мелочи --- */
 
+
+/**
+ * График процентной метрики (CPU/память) за период.
+ * points: [{ ts: unixtime, value: number }]
+ */
+export function percentChart(points, { height = 150, color = '#7c5cff', max = 100, unit = '%' } = {}) {
+  const data = (points || []).filter((p) => Number.isFinite(Number(p.value)));
+  if (data.length < 2) {
+    return `<div class="chart-empty">Мало данных — график заполнится через пару минут</div>`;
+  }
+  const width = 640;
+  const pad = { l: 34, r: 8, t: 10, b: 20 };
+  const innerW = width - pad.l - pad.r;
+  const innerH = height - pad.t - pad.b;
+  const top = max || Math.max(...data.map((p) => Number(p.value)), 1);
+  const stepX = innerW / (data.length - 1);
+  const x = (i) => pad.l + i * stepX;
+  const y = (v) => pad.t + innerH - Math.min(1, Math.max(0, Number(v) / top)) * innerH;
+  const line = data.map((p, i) => `${i ? 'L' : 'M'}${x(i).toFixed(1)},${y(p.value).toFixed(1)}`).join(' ');
+  const area = `${line} L${x(data.length - 1).toFixed(1)},${(pad.t + innerH).toFixed(1)} L${pad.l},${(pad.t + innerH).toFixed(1)} Z`;
+  const gid = `pg${Math.random().toString(36).slice(2, 8)}`;
+
+  let grid = '';
+  for (let i = 0; i <= 4; i += 1) {
+    const value = (top / 4) * i;
+    const yy = y(value);
+    grid += `<line x1="${pad.l}" y1="${yy.toFixed(1)}" x2="${width - pad.r}" y2="${yy.toFixed(1)}"
+      stroke="#1c2434" stroke-width="1" ${i === 0 ? '' : 'stroke-dasharray="3 5"'}/>`;
+    grid += `<text x="${pad.l - 7}" y="${(yy + 3.5).toFixed(1)}" text-anchor="end" fill="#6f7a92"
+      font-size="9.5">${Math.round(value)}${unit}</text>`;
+  }
+
+  const tick = Math.max(1, Math.ceil(data.length / 5));
+  let labels = '';
+  data.forEach((p, i) => {
+    if (i % tick !== 0 && i !== data.length - 1) return;
+    const time = new Date(Number(p.ts) * 1000).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
+    labels += `<text x="${x(i).toFixed(1)}" y="${height - 5}" text-anchor="middle" fill="#6f7a92"
+      font-size="9.5">${time}</text>`;
+  });
+
+  return `<svg class="percent-chart" viewBox="0 0 ${width} ${height}" width="100%" height="${height}" preserveAspectRatio="none">
+    <defs><linearGradient id="${gid}" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="${color}" stop-opacity=".35"/>
+      <stop offset="100%" stop-color="${color}" stop-opacity="0"/>
+    </linearGradient></defs>
+    ${grid}
+    <path d="${area}" fill="url(#${gid})"/>
+    <path d="${line}" fill="none" stroke="${color}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+    ${labels}
+  </svg>`;
+}
+
 export function usageBar(used, limit) {
   const percent = limit ? Math.min(100, (used / limit) * 100) : 0;
   const cls = limit ? (percent >= 95 ? 'danger' : percent >= 70 ? 'warn' : '') : 'unlimited';
@@ -510,6 +566,17 @@ export function usageBar(used, limit) {
       <div class="lbl"><b>${fmtBytes(used)}</b><span>${limit ? `из ${fmtBytes(limit)}` : 'без лимита'}</span></div>
       <div class="bar ${cls}"><i style="width:${limit ? Math.max(percent, 1.5).toFixed(1) : 100}%"></i></div>
     </div>`;
+}
+
+export function uptimeText(seconds) {
+  const value = Number(seconds || 0);
+  if (value <= 0) return '—';
+  const days = Math.floor(value / 86400);
+  const hours = Math.floor((value % 86400) / 3600);
+  const minutes = Math.floor((value % 3600) / 60);
+  if (days) return `${days} д ${hours} ч`;
+  if (hours) return `${hours} ч ${minutes} м`;
+  return `${minutes} м`;
 }
 
 export function formField(form, name) {

@@ -21,6 +21,18 @@ from typing import Any
 from .utils import b64url, to_bool, to_int
 
 API_PORT = 10085
+API_LISTEN = f"127.0.0.1:{API_PORT}"
+#: Имена транспортов Xray. h2 (HTTP/2) удалён из ядра — использовать httpupgrade/xhttp.
+#: Имена, которые понимают все версии Xray (современные алиасы: raw/websocket).
+TRANSPORTS = {"tcp", "ws", "grpc", "xhttp", "httpupgrade"}
+#: ALPN по умолчанию: gRPC живёт только на h2, WebSocket/HTTPUpgrade — только на http/1.1.
+TRANSPORT_ALPN = {
+    "grpc": ["h2"],
+    "ws": ["http/1.1"],
+    "httpupgrade": ["http/1.1"],
+    "xhttp": ["h2"],
+}
+DEFAULT_ALPN = ["h2", "http/1.1"]
 DNS_PRESETS = {
     "cloudflare": ["1.1.1.1", "1.0.0.1", "2606:4700:4700::1111", "2606:4700:4700::1001"],
     "google": ["8.8.8.8", "8.8.4.4", "2001:4860:4860::8888"],
@@ -46,21 +58,34 @@ def user_email(user: Any) -> str:
     return str(user["username"])
 
 
+VISION_FLOW = "xtls-rprx-vision"
+
+
 def effective_flow(node: Any, user: Any) -> str:
-    """flow имеет смысл только для VLESS + TCP + TLS/Reality."""
+    """flow поддерживается только для VLESS + TCP + TLS/Reality и только Vision.
+
+    Xray 25.x принимает единственное значение ``xtls-rprx-vision`` (все прежние
+    ``xtls-rprx-direct`` и подобные удалены), а на WS/gRPC/XHTTP flow запрещён —
+    конфиг с ним не поднимется.
+    """
     if (_get(node, "protocol") or "vless") != "vless":
         return ""
     if (_get(node, "transport") or "tcp") != "tcp":
         return ""
     if (_get(node, "security") or "none") not in ("reality", "tls"):
         return ""
-    return (_get(user, "flow") or _get(node, "flow") or "").strip()
+    flow = (_get(user, "flow") or _get(node, "flow") or "").strip()
+    return VISION_FLOW if flow == VISION_FLOW else ""
 
 
 def client_entry(node: Any, user: Any) -> dict[str, Any]:
-    protocol = (node["protocol"] or "vless").lower()
+    """Клиент inbound'а в том виде, в каком его понимает Xray.
+
+    Поля ``limitIp`` в Xray нет (это расширение XrayR/3x-ui) — лимит устройств
+    панель считает сама, поэтому в конфиг он не попадает.
+    """
+    protocol = (_get(node, "protocol") or "vless").lower()
     email = user_email(user)
-    limit_ip = to_int(_get(user, "device_limit", 0))
     if protocol == "trojan":
         client: dict[str, Any] = {"password": user["uuid"], "email": email}
     elif protocol == "vmess":
@@ -70,69 +95,93 @@ def client_entry(node: Any, user: Any) -> dict[str, Any]:
         flow = effective_flow(node, user)
         if flow:
             client["flow"] = flow
-    if limit_ip:
-        client["limitIp"] = limit_ip
     return client
 
 
+def transport_alpn(transport: str) -> list[str]:
+    """ALPN по умолчанию для TLS: gRPC требует h2 первым, WebSocket — только http/1.1."""
+    return list(TRANSPORT_ALPN.get((transport or "tcp").lower(), DEFAULT_ALPN))
+
+
+def effective_alpn(node: Any) -> list[str]:
+    """ALPN ноды с поправкой на транспорт (gRPC всегда h2, WebSocket — http/1.1)."""
+    transport = (_get(node, "transport") or "tcp").lower()
+    raw = [a.strip() for a in str(_get(node, "alpn") or "").split(",") if a.strip()]
+    if transport == "grpc":
+        return ["h2"]
+    if transport in ("ws", "httpupgrade"):
+        return ["http/1.1"]
+    return raw or transport_alpn(transport)
+
+
+def split_short_ids(value: Any) -> list[str]:
+    return [s.strip() for s in str(value or "").split(",") if s.strip()]
+
+
+def normalize_short_id(value: str) -> str:
+    """shortId в REALITY — чётное число hex-символов, до 16 штук."""
+    cleaned = (value or "").strip().lower()
+    if cleaned and (len(cleaned) > 16 or any(c not in "0123456789abcdef" for c in cleaned)):
+        raise ValueError(f"shortId «{value}» должен состоять из hex-цифр (до 16 символов)")
+    if cleaned and len(cleaned) % 2:
+        raise ValueError(f"shortId «{value}» должен иметь чётное число hex-символов")
+    return cleaned
+
+
 def _stream_settings(node: Any) -> dict[str, Any]:
-    transport = (node["transport"] or "tcp").lower()
-    security = (node["security"] or "none").lower()
-    sni = (node["sni"] or "").strip()
+    transport = (_get(node, "transport") or "tcp").lower()
+    security = (_get(node, "security") or "none").lower()
+    sni = (_get(node, "sni") or "").strip()
+    path = (_get(node, "path") or "").strip() or "/"
     stream: dict[str, Any] = {"network": transport}
 
     if transport == "ws":
-        headers = {"Host": sni} if sni else {}
-        stream["wsSettings"] = {"path": node["path"] or "/", "headers": headers}
+        ws: dict[str, Any] = {"path": path}
+        if sni:
+            # На сервере host — проверка заголовка Host у клиента (headers — только клиентские).
+            ws["host"] = sni
+        stream["wsSettings"] = ws
+    elif transport == "httpupgrade":
+        hu: dict[str, Any] = {"path": path}
+        if sni:
+            hu["host"] = sni
+        stream["httpupgradeSettings"] = hu
     elif transport == "grpc":
         stream["grpcSettings"] = {
-            "serviceName": node["service_name"] or "dfxray",
+            "serviceName": (_get(node, "service_name") or "dfxray").strip() or "dfxray",
             "multiMode": False,
         }
     elif transport == "xhttp":
         stream["xhttpSettings"] = {
-            "path": node["path"] or "/",
-            "host": sni or None,
+            "path": path,
             "mode": "auto",
         }
-        # None-значения Xray не любит — вычищаем.
-        stream["xhttpSettings"] = {
-            k: v for k, v in stream["xhttpSettings"].items() if v is not None
-        }
-    elif transport == "h2":
-        stream["httpSettings"] = {"path": node["path"] or "/", "host": [sni] if sni else []}
     else:
         stream["tcpSettings"] = {"header": {"type": "none"}}
 
     if security == "reality":
-        dest = (node["dest"] or "").strip() or f"{sni or 'www.microsoft.com'}:443"
-        short_ids = [s.strip() for s in (node["short_id"] or "").split(",") if s.strip()] or [""]
+        dest = (_get(node, "dest") or "").strip() or f"{sni or 'www.microsoft.com'}:443"
+        short_ids = [normalize_short_id(s) for s in split_short_ids(_get(node, "short_id"))] or [""]
         stream["security"] = "reality"
         stream["realitySettings"] = {
             "show": False,
-            "dest": dest,
+            "target": dest,
             "xver": 0,
             "serverNames": [sni] if sni else ["www.microsoft.com"],
-            "privateKey": node["private_key"] or "",
+            "privateKey": _get(node, "private_key") or "",
             "shortIds": short_ids,
-            "spiderX": "/",
         }
     elif security == "tls":
-        alpn = [a.strip() for a in (node["alpn"] or "").split(",") if a.strip()]
         stream["security"] = "tls"
         stream["tlsSettings"] = {
-            "serverName": sni or None,
-            "alpn": alpn or ["h2", "http/1.1"],
+            "alpn": effective_alpn(node),
             "minVersion": "1.2",
             "certificates": [
                 {
-                    "certificateFile": node["cert_file"] or "/etc/xray/cert/fullchain.pem",
-                    "keyFile": node["key_file"] or "/etc/xray/cert/privkey.pem",
+                    "certificateFile": _get(node, "cert_file") or "/etc/xray/cert/fullchain.pem",
+                    "keyFile": _get(node, "key_file") or "/etc/xray/cert/privkey.pem",
                 }
             ],
-        }
-        stream["tlsSettings"] = {
-            k: v for k, v in stream["tlsSettings"].items() if v is not None
         }
     else:
         stream["security"] = "none"
@@ -140,7 +189,7 @@ def _stream_settings(node: Any) -> dict[str, Any]:
 
 
 def node_inbound(node: Any, users: Iterable[Any]) -> dict[str, Any]:
-    protocol = (node["protocol"] or "vless").lower()
+    protocol = (_get(node, "protocol") or "vless").lower()
     clients = [client_entry(node, user) for user in users]
     if protocol == "vless":
         settings: dict[str, Any] = {"clients": clients, "decryption": "none"}
@@ -149,9 +198,9 @@ def node_inbound(node: Any, users: Iterable[Any]) -> dict[str, Any]:
     else:
         settings = {"clients": clients}
     inbound = {
-        "tag": f"node-{node['id']}-{protocol}",
+        "tag": f"node-{_get(node, 'id')}-{protocol}",
         "listen": "0.0.0.0",
-        "port": to_int(node["port"], 443),
+        "port": to_int(_get(node, "port"), 443),
         "protocol": protocol,
         "settings": settings,
         "streamSettings": _stream_settings(node),
@@ -166,20 +215,17 @@ def node_inbound(node: Any, users: Iterable[Any]) -> dict[str, Any]:
     return inbound
 
 
-def api_inbound() -> dict[str, Any]:
+def api_object() -> dict[str, Any]:
+    """API статистики Xray. Упрощённый режим (Xray ≥ 1.8.12): listen прямо в api."""
     return {
         "tag": "api",
-        "listen": "127.0.0.1",
-        "port": API_PORT,
-        "protocol": "dokodemo-door",
-        "settings": {"address": "127.0.0.1"},
+        "listen": API_LISTEN,
+        "services": ["HandlerService", "StatsService"],
     }
 
 
 def _routing(settings: dict[str, str]) -> dict[str, Any]:
-    rules: list[dict[str, Any]] = [
-        {"type": "field", "inboundTag": ["api"], "outboundTag": "api"}
-    ]
+    rules: list[dict[str, Any]] = []
     if _truthy(settings.get("block_bittorrent")):
         rules.append(
             {"type": "field", "protocol": ["bittorrent"], "outboundTag": "block"}
@@ -285,7 +331,7 @@ def build_config(
     config: dict[str, Any] = {
         "log": {"loglevel": "warning", "access": "none"},
         "dns": dns,
-        "inbounds": [api_inbound(), node_inbound(node, users)],
+        "inbounds": [node_inbound(node, users)],
         "outbounds": _merge_outbounds(
             [
                 {"tag": "direct", "protocol": "freedom", "settings": {"domainStrategy": "UseIPv4v6"}},
@@ -315,7 +361,7 @@ def build_config(
                 "statsOutboundDownlink": True,
             },
         },
-        "api": {"tag": "api", "services": ["StatsService", "HandlerService"]},
+        "api": api_object(),
     }
     return config
 
@@ -335,36 +381,41 @@ def _query(params: dict[str, Any]) -> str:
 
 
 def build_link(node: Any, user: Any, panel_title: str = "DF_Xray") -> str:
-    protocol = (node["protocol"] or "vless").lower()
-    address = node["address"]
-    port = to_int(node["port"], 443)
-    transport = (node["transport"] or "tcp").lower()
-    security = (node["security"] or "none").lower()
-    sni = (node["sni"] or "").strip()
-    fingerprint = (node["fingerprint"] or "chrome").strip()
-    alpn = [a.strip() for a in (node["alpn"] or "").split(",") if a.strip()]
-    label = f"{user['username']} · {node['name']} · {panel_title}"
+    protocol = (_get(node, "protocol") or "vless").lower()
+    address = _get(node, "address") or ""
+    port = to_int(_get(node, "port"), 443)
+    transport = (_get(node, "transport") or "tcp").lower()
+    security = (_get(node, "security") or "none").lower()
+    sni = (_get(node, "sni") or "").strip()
+    if not sni and security == "tls":
+        sni = address
+    fingerprint = (_get(node, "fingerprint") or "chrome").strip()
+    path = (_get(node, "path") or "/") or "/"
+    service_name = (_get(node, "service_name") or "dfxray").strip() or "dfxray"
+    alpn = [] if security == "reality" else effective_alpn(node)
+    label = f"{user['username']} · {_get(node, 'name') or address} · {panel_title}"
     frag = _fragment(label)
 
     common_net: dict[str, Any] = {"type": transport}
     if transport == "ws":
-        common_net["path"] = node["path"] or "/"
+        common_net["path"] = path
         if sni:
             common_net["host"] = sni
     elif transport == "grpc":
-        common_net["serviceName"] = node["service_name"] or "dfxray"
+        common_net["serviceName"] = service_name
         common_net["mode"] = "gun"
     elif transport == "xhttp":
-        common_net["path"] = node["path"] or "/"
+        common_net["path"] = path
         common_net["mode"] = "auto"
         if sni:
             common_net["host"] = sni
-    elif transport == "h2":
-        common_net["path"] = node["path"] or "/"
+    elif transport == "httpupgrade":
+        common_net["path"] = path
         if sni:
             common_net["host"] = sni
 
     if protocol == "vmess":
+        http_like = transport in ("ws", "xhttp", "httpupgrade")
         payload = {
             "v": "2",
             "ps": label,
@@ -373,17 +424,23 @@ def build_link(node: Any, user: Any, panel_title: str = "DF_Xray") -> str:
             "id": user["uuid"],
             "aid": "0",
             "scy": "auto",
-            "net": transport,
-            "type": "none",
-            "host": sni if transport in ("ws", "xhttp", "h2") else "",
-            "path": (node["path"] or "/") if transport in ("ws", "xhttp", "h2") else "",
-            "tls": "tls" if security in ("tls", "reality") else "",
-            "sni": sni,
-            "alpn": ",".join(alpn),
+            "net": "ws" if transport == "ws" else transport,
+            "type": "gun" if transport == "grpc" else "none",
+            "host": sni if http_like else "",
+            "path": path if http_like else "",
+            "tls": security if security in ("tls", "reality") else "",
+            "sni": sni if security in ("tls", "reality") else "",
+            "alpn": ",".join(alpn) if security == "tls" else "",
             "fp": fingerprint if security in ("tls", "reality") else "",
         }
         if transport == "grpc":
-            payload["path"] = node["service_name"] or "dfxray"
+            payload["path"] = service_name
+        if transport == "xhttp":
+            payload["type"] = "auto"
+        if security == "reality":
+            payload["pbk"] = _get(node, "public_key") or ""
+            payload["sid"] = (_get(node, "short_id") or "").split(",")[0].strip()
+            payload["spx"] = "/"
         raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()
         return "vmess://" + base64.b64encode(raw).decode()
 
@@ -393,8 +450,8 @@ def build_link(node: Any, user: Any, panel_title: str = "DF_Xray") -> str:
             "security": "reality",
             "sni": sni,
             "fp": fingerprint,
-            "pbk": node["public_key"] or "",
-            "sid": (node["short_id"] or "").split(",")[0].strip(),
+            "pbk": _get(node, "public_key") or "",
+            "sid": (_get(node, "short_id") or "").split(",")[0].strip(),
             "spx": "/",
             **common_net,
         }

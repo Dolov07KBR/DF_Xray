@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import datetime as dt
 import sqlite3
+import time
 from typing import Any
 
 from . import config, db
@@ -64,7 +65,8 @@ NODE_FIELDS = (
     "sort",
 )
 
-TRANSPORTS = ("tcp", "ws", "grpc", "xhttp", "h2")
+#: Актуальные транспорты Xray: HTTP/2 удалён из ядра, вместо него httpupgrade.
+TRANSPORTS = ("tcp", "ws", "grpc", "xhttp", "httpupgrade")
 SECURITIES = ("reality", "tls", "none")
 PROTOCOLS = ("vless", "vmess", "trojan")
 
@@ -417,8 +419,14 @@ def serialize_node(row: sqlite3.Row | dict[str, Any], with_secrets: bool = False
         "xray_running": None if data.get("xray_running") is None else bool(to_int(data.get("xray_running"))),
         "uptime_seconds": to_int(data.get("uptime_seconds")),
         "load1": float(data.get("load1") or 0),
+        "cpu": float(data.get("cpu") or 0),
         "mem_used": to_int(data.get("mem_used")),
         "mem_total": to_int(data.get("mem_total")),
+        "mem_percent": (
+            round(to_int(data.get("mem_used")) * 100 / to_int(data.get("mem_total")), 1)
+            if to_int(data.get("mem_total"))
+            else 0.0
+        ),
         "cfg_revision": data.get("cfg_revision") or "",
         "applied_at": data.get("applied_at") or "",
         "last_error": data.get("last_error") or "",
@@ -625,11 +633,16 @@ def update_node_metrics(node_id: int, payload: dict[str, Any]) -> None:
         with contextlib.suppress(TypeError, ValueError):
             fields["load1"] = max(0.0, float(payload.get("load1") or 0))
     memory = payload.get("memory") or {}
+    cpu = None
     if isinstance(memory, dict):
         if memory.get("used") is not None:
             fields["mem_used"] = max(0, to_int(memory.get("used")))
         if memory.get("total") is not None:
             fields["mem_total"] = max(0, to_int(memory.get("total")))
+    if "cpu" in payload:
+        with contextlib.suppress(TypeError, ValueError):
+            cpu = round(max(0.0, min(100.0, float(payload.get("cpu") or 0))), 1)
+            fields["cpu"] = cpu
     revision = (payload.get("revision") or "").strip()[:40]
     if revision:
         fields["cfg_revision"] = revision
@@ -640,6 +653,16 @@ def update_node_metrics(node_id: int, payload: dict[str, Any]) -> None:
 
     assignments = ", ".join(f"{key} = ?" for key in fields)
     db.run(f"UPDATE nodes SET {assignments} WHERE id = ?", (*fields.values(), node_id))
+
+    # История метрик для графиков на дашборде (панель пишет то же самое для node_id = 0).
+    if cpu is not None or "mem_used" in fields:
+        add_metrics(
+            node_id,
+            cpu if cpu is not None else 0.0,
+            fields.get("mem_used", 0),
+            fields.get("mem_total", 0),
+            fields.get("load1", 0.0),
+        )
 
 
 def touch_node(node_id: int, version: str | None = None) -> None:
@@ -1000,3 +1023,108 @@ def update_outbound(outbound_id: int, payload: dict[str, Any]) -> None:
 
 def delete_outbound(outbound_id: int) -> None:
     db.run("DELETE FROM outbounds WHERE id = ?", (outbound_id,))
+
+
+# --------------------------------------------------------------------------
+# Команды агентам нод (перезапуск Xray и проверка конфига)
+# --------------------------------------------------------------------------
+
+NODE_COMMANDS: dict[str, str] = {
+    "restart_xray": "Перезапустить Xray",
+    "test_config": "Проверить конфиг через xray -test",
+    "restart_agent": "Перезапустить агент",
+}
+MAX_PENDING_COMMANDS = 5
+
+
+def create_node_command(node_id: int, command: str, actor: str = "") -> int:
+    if command not in NODE_COMMANDS:
+        raise ValueError("Неизвестная команда для ноды")
+    stamp = iso()
+    command_id = db.run(
+        "INSERT INTO node_commands(node_id, command, status, created_by, created_at) "
+        "VALUES(?, ?, 'pending', ?, ?)",
+        (node_id, command, actor, stamp),
+    )
+    return int(command_id)
+
+
+def node_commands_queue(node_id: int, limit: int = MAX_PENDING_COMMANDS) -> list[dict[str, Any]]:
+    rows = db.all(
+        "SELECT * FROM node_commands WHERE node_id = ? AND status = 'pending' "
+        "ORDER BY id ASC LIMIT ?",
+        (node_id, limit),
+    )
+    items = [dict(row) for row in rows]
+    if items:
+        placeholders = ",".join("?" for _ in items)
+        db.run(
+            f"UPDATE node_commands SET status = 'running' WHERE id IN ({placeholders})",
+            tuple(item["id"] for item in items),
+        )
+    return items
+
+
+COMMAND_OK_STATUSES = {"done", "ok", "success", "completed", "0"}
+
+
+def finish_node_command(command_id: int, status: str, result: str = "") -> None:
+    """Зафиксировать результат команды. Агент присылает done/error, но панель
+    принимает и человеческие варианты (ok/success), чтобы не писать ложную ошибку."""
+    normalized = "done" if str(status).strip().lower() in COMMAND_OK_STATUSES else "error"
+    db.run(
+        "UPDATE node_commands SET status = ?, result = ?, finished_at = ? WHERE id = ?",
+        (normalized, str(result)[:400], iso(), command_id),
+    )
+
+
+def list_node_commands(node_id: int, limit: int = 15) -> list[dict[str, Any]]:
+    rows = db.all(
+        "SELECT * FROM node_commands WHERE node_id = ? ORDER BY id DESC LIMIT ?",
+        (node_id, limit),
+    )
+    items = []
+    for row in rows:
+        item = dict(row)
+        item["title"] = NODE_COMMANDS.get(item["command"], item["command"])
+        items.append(item)
+    return items
+
+
+# --------------------------------------------------------------------------
+# Метрики железа: панель (node_id = 0) и ноды
+# --------------------------------------------------------------------------
+
+PANEL_METRICS_ID = 0
+
+
+def add_metrics(node_id: int, cpu: float, mem_used: int, mem_total: int, load1: float) -> None:
+    db.run(
+        "INSERT INTO metrics(node_id, ts, cpu, mem_used, mem_total, load1) VALUES(?,?,?,?,?,?)",
+        (node_id, int(time.time()), round(float(cpu or 0), 1), max(0, to_int(mem_used)),
+         max(0, to_int(mem_total)), round(float(load1 or 0), 2)),
+    )
+
+
+def metrics_series(node_id: int, minutes: int = 60, limit: int = 720) -> list[dict[str, Any]]:
+    since = int(time.time()) - max(1, minutes) * 60
+    rows = db.all(
+        "SELECT ts, cpu, mem_used, mem_total, load1 FROM metrics "
+        "WHERE node_id = ? AND ts >= ? ORDER BY ts DESC LIMIT ?",
+        (node_id, since, limit),
+    )
+    return [dict(row) for row in reversed(rows)]
+
+
+def prune_metrics(hours: int = 48) -> int:
+    cutoff = int(time.time()) - max(1, hours) * 3600
+    return int(db.run("DELETE FROM metrics WHERE ts < ?", (cutoff,)))
+
+
+def latest_metrics(node_id: int) -> dict[str, Any] | None:
+    row = db.one(
+        "SELECT ts, cpu, mem_used, mem_total, load1 FROM metrics "
+        "WHERE node_id = ? ORDER BY ts DESC, rowid DESC LIMIT 1",
+        (node_id,),
+    )
+    return dict(row) if row else None

@@ -50,6 +50,13 @@ def user(**overrides):
     return base
 
 
+def node_inbound(config_data):
+    for inbound in config_data["inbounds"]:
+        if str(inbound.get("tag", "")).startswith("node-"):
+            return inbound
+    raise AssertionError("в конфиге нет inbound ноды")
+
+
 class PasswordTests(unittest.TestCase):
     def test_hash_and_verify(self):
         stored = auth.hash_password("correct horse battery staple")
@@ -140,11 +147,11 @@ class ConfigTests(unittest.TestCase):
     def test_clients_only_active(self):
         users = [user(id=1, username="a"), user(id=2, username="b")]
         config_data = xray.build_config(node(), users, {})
-        inbound = config_data["inbounds"][1]
+        inbound = node_inbound(config_data)
         emails = [client["email"] for client in inbound["settings"]["clients"]]
         self.assertEqual(emails, ["a", "b"])
         self.assertEqual(inbound["settings"]["decryption"], "none")
-        self.assertEqual(config_data["inbounds"][0]["port"], xray.API_PORT)
+        self.assertEqual(config_data["api"]["listen"], f"127.0.0.1:{xray.API_PORT}")
 
     def test_routing_rules_toggle(self):
         config_data = xray.build_config(node(), [], {"block_bittorrent": "0", "block_private": "0"})
@@ -162,25 +169,34 @@ class ConfigTests(unittest.TestCase):
 
     def test_no_flow_for_ws(self):
         config_data = xray.build_config(node(transport="ws", security="tls"), [user(flow="xtls-rprx-vision")], {})
-        client = config_data["inbounds"][1]["settings"]["clients"][0]
+        client = node_inbound(config_data)["settings"]["clients"][0]
         self.assertNotIn("flow", client)
 
     def test_reality_requires_keys(self):
         config_data = xray.build_config(node(), [])
-        reality = config_data["inbounds"][1]["streamSettings"]["realitySettings"]
+        reality = node_inbound(config_data)["streamSettings"]["realitySettings"]
         self.assertEqual(reality["privateKey"], "PRIVATE_KEY")
         self.assertEqual(reality["shortIds"], ["abcd1234"])
-        self.assertEqual(reality["dest"], "www.microsoft.com:443")
+        self.assertEqual(reality["target"], "www.microsoft.com:443")
 
     def test_tls_certificates(self):
         config_data = xray.build_config(node(security="tls"), [])
-        tls = config_data["inbounds"][1]["streamSettings"]["tlsSettings"]
+        tls = node_inbound(config_data)["streamSettings"]["tlsSettings"]
         self.assertEqual(tls["certificates"][0]["certificateFile"], "/etc/xray/cert/fullchain.pem")
         self.assertEqual(tls["alpn"], ["h2", "http/1.1"])
 
-    def test_device_limit(self):
+    def test_device_limit_is_not_sent_to_xray(self):
+        """limitIp — поле XrayR, а не Xray: в конфиг оно попадать не должно."""
         config_data = xray.build_config(node(), [user(device_limit=3)], {})
-        self.assertEqual(config_data["inbounds"][1]["settings"]["clients"][0]["limitIp"], 3)
+        client = node_inbound(config_data)["settings"]["clients"][0]
+        self.assertNotIn("limitIp", client)
+        self.assertEqual(client["email"], "alex")
+
+    def test_flow_only_vision_and_only_for_tcp(self):
+        vision = xray.client_entry(node(), user(flow="xtls-rprx-vision"))
+        self.assertEqual(vision["flow"], "xtls-rprx-vision")
+        self.assertNotIn("flow", xray.client_entry(node(), user(flow="xtls-rprx-direct")))
+        self.assertNotIn("flow", xray.client_entry(node(transport="ws"), user(flow="xtls-rprx-vision")))
 
 
 if __name__ == "__main__":

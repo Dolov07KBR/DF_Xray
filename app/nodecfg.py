@@ -12,19 +12,28 @@ from typing import Any
 from . import sni
 
 PROTOCOLS: dict[str, str] = {"vless": "VLESS", "vmess": "VMess", "trojan": "Trojan"}
+#: Актуальные транспорты Xray. HTTP/2 (h2) удалён из ядра — вместо него httpupgrade/xhttp.
 TRANSPORTS: dict[str, str] = {
-    "tcp": "TCP",
+    "tcp": "TCP (RAW)",
     "ws": "WebSocket",
     "grpc": "gRPC",
     "xhttp": "XHTTP",
-    "h2": "HTTP/2",
+    "httpupgrade": "HTTPUpgrade",
 }
 SECURITIES: dict[str, str] = {"reality": "Reality", "tls": "TLS", "none": "Без шифрования"}
 
-#: Reality работает только поверх этих транспортов.
+#: Reality работает только поверх этих транспортов (документация Xray: RAW, XHTTP, gRPC).
 REALITY_TRANSPORTS = ("tcp", "grpc", "xhttp")
 #: Транспорты, которым нужен HTTP-путь.
-PATH_TRANSPORTS = ("ws", "xhttp", "h2")
+PATH_TRANSPORTS = ("ws", "xhttp", "httpupgrade")
+#: ALPN по умолчанию: gRPC — только h2, WebSocket/HTTPUpgrade — только http/1.1.
+TRANSPORT_ALPN = {
+    "grpc": "h2",
+    "ws": "http/1.1",
+    "httpupgrade": "http/1.1",
+    "xhttp": "h2,http/1.1",
+    "tcp": "h2,http/1.1",
+}
 #: xtls-rprx-vision осмыслен только для VLESS + TCP + TLS/Reality.
 VISION_FLOW = "xtls-rprx-vision"
 
@@ -82,7 +91,7 @@ PRESETS: tuple[dict[str, Any], ...] = (
         "flow": "",
         "port": 8443,
         "path": "/dfws",
-        "alpn": "h2,http/1.1",
+        "alpn": "http/1.1",
     },
     {
         "id": "tls-grpc",
@@ -108,7 +117,7 @@ PRESETS: tuple[dict[str, Any], ...] = (
         "flow": "",
         "port": 8443,
         "path": "/vmess",
-        "alpn": "h2,http/1.1",
+        "alpn": "http/1.1",
     },
     {
         "id": "trojan-tls",
@@ -168,17 +177,27 @@ def validate(data: dict[str, Any]) -> None:
             "выберите TCP, gRPC или XHTTP"
         )
     if security == "reality" and protocol == "trojan":
-        raise ValueError("Reality не поддерживается для Trojan: нужен Fusion/TLS")
+        raise ValueError("Reality несовместим с Trojan (только VLESS). Выберите TLS")
+    if security == "reality" and protocol == "vmess":
+        raise ValueError("Reality несовместим с VMess (только VLESS). Выберите TLS")
     if protocol == "trojan" and security == "none":
         raise ValueError("Trojan без TLS не имеет смысла — выберите TLS")
     if flow and flow != VISION_FLOW:
         raise ValueError("Неизвестный flow")
     if flow and not supports_vision(protocol, transport, security):
         raise ValueError("xtls-rprx-vision доступен только для VLESS + TCP + TLS/Reality")
-    if security in ("reality", "tls") and transport in PATH_TRANSPORTS:
+    if transport in PATH_TRANSPORTS:
         path = str(data.get("path") or "")
         if path and not path.startswith("/"):
             raise ValueError("Путь должен начинаться со слеша")
+    alpn = [a.strip() for a in str(data.get("alpn") or "").split(",") if a.strip()]
+    if security == "tls" and alpn:
+        if transport == "grpc" and alpn[0] != "h2":
+            raise ValueError("Для gRPC в ALPN первым должен идти h2, иначе рукопожатие не пройдёт")
+        if transport in ("ws", "httpupgrade") and "h2" in alpn:
+            raise ValueError(
+                f"{TRANSPORTS[transport]} работает только по http/1.1 — уберите h2 из ALPN"
+            )
 
 
 def require_sni(data: dict[str, Any]) -> None:
@@ -214,8 +233,13 @@ def decorate(data: dict[str, Any]) -> dict[str, Any]:
         result["path"] = "/dfx"
     if transport == "grpc" and not str(result.get("service_name") or "").strip():
         result["service_name"] = "dfxray"
-    if security == "tls" and not str(result.get("alpn") or "").strip():
-        result["alpn"] = "h2,http/1.1"
+    if security == "tls":
+        result["alpn"] = TRANSPORT_ALPN.get(transport, "h2,http/1.1")
+    else:
+        result["alpn"] = ""
+    if security == "reality":
+        sid = str(result.get("short_id") or "").strip()
+        result["short_id"] = sid.split(",")[0].strip() if sid else ""
     return result
 
 
@@ -232,6 +256,7 @@ def meta() -> dict[str, Any]:
         "transports": [{"id": key, "label": label} for key, label in TRANSPORTS.items()],
         "securities": [{"id": key, "label": label} for key, label in SECURITIES.items()],
         "reality_transports": list(REALITY_TRANSPORTS),
+        "transport_alpn": dict(TRANSPORT_ALPN),
         "path_transports": list(PATH_TRANSPORTS),
         "vision_flow": VISION_FLOW,
         "sni": sni.catalog(),

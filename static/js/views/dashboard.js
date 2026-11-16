@@ -1,8 +1,8 @@
 /* Дашборд: сводка, график трафика, ноды, истекающие подписки, топ и журнал. */
 
 import {
-  api, bind, areaChart, auditIcon, auditLabel, auditText, esc, fmtBytes, fmtDate, icon,
-  relTime, sparkline, state, statusBadge, usageBar,
+  api, areaChart, auditIcon, auditLabel, auditText, bind, esc, fmtBytes, fmtDate, icon,
+  percentChart, relTime, sparkline, state, statusBadge, uptimeText, usageBar,
 } from '../core.js';
 
 function statCard({ label, value, unit = '', iconName, tone = '', foot = '', spark = '' }) {
@@ -74,6 +74,11 @@ export async function render(container, { setActions, navigate }) {
         <div class="body">
           <b>${esc(node.name)}</b>
           <span class="mono">${esc(node.address)}:${node.port} · ${esc(node.transport)}/${esc(node.security)}</span>
+          <span class="muted" style="font-size:11px">
+            CPU ${Math.round(node.cpu || 0)}% ·
+            RAM ${node.mem_percent != null ? Math.round(node.mem_percent) : (node.mem_total ? Math.round((node.mem_used / node.mem_total) * 100) : 0)}% ·
+            up ${uptimeText(node.uptime_seconds)}
+          </span>
         </div>
         <div style="text-align:right">
           ${statusBadge(node.health === 'degraded' ? 'limited' : node.status, node.health === 'degraded' ? { limited: 'Xray остановлен' } : undefined)}
@@ -118,6 +123,43 @@ export async function render(container, { setActions, navigate }) {
           <div class="val">${fmtBytes(node.total)}</div>
         </div>`).join('')}</div>`
     : `<div class="empty" style="border:0;padding:24px"><b>Серверов нет</b></div>`;
+
+  const system = data.system || {};
+  const host = system.host || {};
+  const points = system.series || [];
+  const cpuPoints = points.map((p) => ({ ts: p.ts, value: p.cpu }));
+  const memPoints = points.map((p) => ({ ts: p.ts, value: p.mem }));
+  const memPercent = host.mem_percent ?? (points.length ? points[points.length - 1].mem : 0);
+  const diskPercent = host.disk && host.disk.total
+    ? Math.round((host.disk.used / host.disk.total) * 100) : 0;
+
+  const systemHtml = `
+    <div class="card">
+      <div class="card-head">
+        <div>
+          <h3>Процессор панели</h3>
+          <div class="hint">${host.cores || 1} ядер · LA1 ${host.load1 ? Number(host.load1).toFixed(2) : '0.00'}</div>
+        </div>
+        <div class="spacer"></div>
+        <b class="metric-now">${Math.round(host.cpu || 0)}<small>%</small></b>
+      </div>
+      <div class="card-body tight">
+        ${percentChart(cpuPoints, { color: '#7c5cff', height: 140 })}
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-head">
+        <div>
+          <h3>Память панели</h3>
+          <div class="hint">${fmtBytes(host.mem_used || 0)} из ${fmtBytes(host.mem_total || 0)} · диск ${diskPercent}%</div>
+        </div>
+        <div class="spacer"></div>
+        <b class="metric-now">${Math.round(memPercent)}<small>%</small></b>
+      </div>
+      <div class="card-body tight">
+        ${percentChart(memPoints, { color: '#2ee6a8', height: 140 })}
+      </div>
+    </div>`;
 
   const auditHtml = (data.audit || []).map((item) => `
     <div class="audit-item">
@@ -164,6 +206,10 @@ export async function render(container, { setActions, navigate }) {
         tone: 'amber',
         foot: `<span class="muted">в ближайшие 7 дней</span>`,
       })}
+    </div>
+
+    <div class="grid grid-2 section">
+      ${systemHtml}
     </div>
 
     <div class="grid grid-main section">

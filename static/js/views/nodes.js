@@ -2,15 +2,15 @@
 
 import {
   api, bind, closeLayer, confirmDialog, copy, download, esc, fmtBytes, formField,
-  formValue, icon, openModal, protoChips, relTime, toast,
+  formValue, icon, openModal, protoChips, relTime, toast, uptimeText,
 } from '../core.js';
 
 const TRANSPORTS = [
-  ['tcp', 'TCP'],
+  ['tcp', 'TCP (RAW)'],
   ['ws', 'WebSocket'],
   ['grpc', 'gRPC'],
   ['xhttp', 'XHTTP'],
-  ['h2', 'HTTP/2'],
+  ['httpupgrade', 'HTTPUpgrade'],
 ];
 const SECURITIES = [['reality', 'Reality'], ['tls', 'TLS'], ['none', 'Без шифрования']];
 const PROTOCOLS = [['vless', 'VLESS'], ['vmess', 'VMess'], ['trojan', 'Trojan']];
@@ -27,17 +27,6 @@ function healthBadge(node) {
   const [label, tone] = HEALTH[node.health] || HEALTH.unknown;
   const when = node.last_seen ? ` · ${relTime(node.last_seen)}` : '';
   return `<span class="status ${tone}" title="${esc(label + when)}"><span class="dot"></span>${esc(label)}</span>`;
-}
-
-function uptimeText(seconds) {
-  const value = Number(seconds || 0);
-  if (value <= 0) return '—';
-  const days = Math.floor(value / 86400);
-  const hours = Math.floor((value % 86400) / 3600);
-  const minutes = Math.floor((value % 3600) / 60);
-  if (days) return `${days} д ${hours} ч`;
-  if (hours) return `${hours} ч ${minutes} м`;
-  return `${minutes} м`;
 }
 
 function cardHtml(node) {
@@ -60,8 +49,9 @@ function cardHtml(node) {
         <div class="nc-stat"><span>Uptime</span><b style="font-size:12px">${uptimeText(node.uptime_seconds)}</b></div>
       </div>
       <div class="nc-stats nc-stats-sub">
-        <div class="nc-stat"><span>LA1</span><b>${node.load1 ? Number(node.load1).toFixed(2) : '—'}</b></div>
+        <div class="nc-stat"><span>CPU</span><b>${node.cpu ? `${Math.round(node.cpu)}%` : '—'}</b></div>
         <div class="nc-stat"><span>Память</span><b>${node.mem_total ? `${Math.round((node.mem_used / node.mem_total) * 100)}%` : '—'}</b></div>
+        <div class="nc-stat"><span>LA1</span><b>${node.load1 ? Number(node.load1).toFixed(2) : '—'}</b></div>
         <div class="nc-stat"><span>Агент</span><b style="font-size:11.5px">${node.agent_version ? esc(node.agent_version) : '—'}</b></div>
       </div>
       ${error ? `<div class="nc-error" title="${esc(error)}">${icon('alert')}<span>${esc(error)}</span></div>` : ''}
@@ -71,12 +61,43 @@ function cardHtml(node) {
         <div class="spacer"></div>
         <button class="icon-btn" data-act="migrate" data-id="${node.id}" title="Перевести клиентов на другую ноду">${icon('route')}</button>
         <button class="icon-btn" data-act="drain" data-id="${node.id}" title="${node.drain ? 'Вернуть в подписки' : 'Вывести из подписок (drain)'}">${icon('power_off')}</button>
+        <button class="icon-btn" data-act="restart-xray" data-id="${node.id}" title="Перезапустить Xray на сервере">${icon('refresh')}</button>
+        <button class="icon-btn" data-act="test-config" data-id="${node.id}" title="Проверить конфиг через xray -test">${icon('check')}</button>
         <button class="icon-btn" data-act="probe" data-id="${node.id}" title="Проверить порт">${icon('wifi')}</button>
         <button class="icon-btn" data-act="edit" data-id="${node.id}" title="Изменить">${icon('edit')}</button>
         <button class="icon-btn" data-act="toggle" data-id="${node.id}" title="${node.enabled ? 'Выключить' : 'Включить'}">${icon('power')}</button>
         <button class="icon-btn" data-act="delete" data-id="${node.id}" title="Удалить">${icon('trash')}</button>
       </div>
     </div>`;
+}
+
+/* --- команды агенту: перезапуск Xray, проверка конфига --- */
+
+function pollNodeCommand(nodeId, commandId, container, ctx, attempt = 0) {
+  const tick = async () => {
+    try {
+      const data = await api(`/api/nodes/${nodeId}/actions`);
+      const item = (data.items || []).find((row) => row.id === commandId);
+      if (item && (item.status === 'done' || item.status === 'error')) {
+        if (item.status === 'done') {
+          toast(`${item.title}: ${item.result || 'готово'}`);
+        } else {
+          toast(`${item.title}: ${item.result || 'ошибка'}`, 'err');
+        }
+        await render(container, ctx);
+        return;
+      }
+    } catch (err) {
+      toast(err.message, 'err');
+      return;
+    }
+    if (attempt >= 20) {
+      toast('Агент пока не ответил — проверьте, что нода онлайн', 'err');
+      return;
+    }
+    setTimeout(() => pollNodeCommand(nodeId, commandId, container, ctx, attempt + 1), 1500);
+  };
+  setTimeout(tick, 1200);
 }
 
 function field(label, inputHtml, hint = '') {
@@ -159,7 +180,9 @@ function nodeFormHtml(node, meta) {
         <div class="form-grid">
           ${field('Сертификат (путь на сервере)', `<input class="input mono" name="cert_file" value="${value('cert_file', '/etc/xray/cert/fullchain.pem')}">`)}
           ${field('Ключ сертификата', `<input class="input mono" name="key_file" value="${value('key_file', '/etc/xray/cert/privkey.pem')}">`)}
-          ${field('ALPN', `<input class="input mono" name="alpn" value="${value('alpn', 'h2,http/1.1')}">`)}
+          ${field('ALPN', `<input class="input mono" name="alpn" value="${value('alpn', 'h2,http/1.1')}"
+                 placeholder="h2,http/1.1">`,
+                 'gRPC — только h2, WebSocket/HTTPUpgrade — только http/1.1. Пустое значение подставится само.')}
         </div>
       </div>
 
@@ -210,7 +233,7 @@ function syncVisibility(form) {
   show('tls-like', security !== 'none');
   show('reality', security === 'reality');
   show('tls', security === 'tls');
-  show('path', ['ws', 'xhttp', 'h2'].includes(transport));
+  show('path', ['ws', 'xhttp', 'httpupgrade'].includes(transport));
   show('grpc', transport === 'grpc');
   show('flow', protocol === 'vless' && transport === 'tcp' && security !== 'none');
 }
@@ -994,6 +1017,25 @@ export async function render(container, ctx) {
         await render(container, ctx);
       } else if (act === 'migrate') {
         openMigrate(node, () => render(container, ctx));
+      } else if (act === 'restart-xray') {
+        const ok = await confirmDialog({
+          title: 'Перезапустить Xray?',
+          text: `Агент на <b>${esc(node ? node.name : 'ноде')}</b> перезапустит Xray. `
+            + 'Текущие подключения оборвутся на несколько секунд, конфиг останется прежним.',
+          confirmText: 'Перезапустить',
+        });
+        if (!ok) return;
+        const result = await api(`/api/nodes/${id}/actions`, {
+          method: 'POST', body: { action: 'restart_xray' },
+        });
+        toast(`Команда «${result.title}» отправлена — ждём агента`);
+        pollNodeCommand(id, result.id, container, ctx);
+      } else if (act === 'test-config') {
+        const result = await api(`/api/nodes/${id}/actions`, {
+          method: 'POST', body: { action: 'test_config' },
+        });
+        toast(`Проверка конфига запущена (${result.id})`);
+        pollNodeCommand(id, result.id, container, ctx);
       } else if (act === 'probe') {
         el.disabled = true;
         el.innerHTML = icon('refresh');

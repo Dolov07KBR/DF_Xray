@@ -113,39 +113,10 @@ const routes = {
 
 const NAV = [
   { href: '#/dashboard', label: 'Дашборд', icon: 'grid' },
-  { href: '#/inbounds', label: 'Входящие', icon: 'inbox' },
   { href: '#/users', label: 'Клиенты', icon: 'users', badge: 'users' },
-  { href: '#/groups', label: 'Группы', icon: 'layers' },
   { href: '#/nodes', label: 'Узлы', icon: 'server' },
-  { href: '#/hosts', label: 'Хосты', icon: 'globe' },
-  { href: '#/outbounds', label: 'Исходящие', icon: 'upload' },
-  { href: '#/routing', label: 'Маршрутизация', icon: 'route' },
-  {
-    id: 'panel',
-    label: 'Настройки панели',
-    icon: 'settings',
-    badge: 'update',
-    items: [
-      ['#/settings?section=general', 'Общие'],
-      ['#/settings?section=subscription', 'Подписки'],
-      ['#/settings?section=security', 'Безопасность'],
-      ['#/settings?section=update', 'Обновление'],
-      ['#/settings?section=maintenance', 'Обслуживание'],
-      ['#/audit', 'Журнал действий'],
-      ['#/settings?section=about', 'О панели'],
-    ],
-  },
-  {
-    id: 'xray',
-    label: 'Конфигурации Xray',
-    icon: 'terminal',
-    items: [
-      ['#/xray?tab=config', 'Конфиг ноды'],
-      ['#/xray?tab=reality', 'Reality-ключи'],
-      ['#/nodes?tab=agents', 'Агенты нод'],
-    ],
-  },
-  { href: '#/api-docs', label: 'Документация API', icon: 'book' },
+  { href: '#/subscriptions', label: 'Подписки', icon: 'link' },
+  { href: '#/settings', label: 'Настройки', icon: 'settings', badge: 'update' },
 ];
 
 function navKey(href) {

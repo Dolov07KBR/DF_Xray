@@ -20,8 +20,11 @@ from . import (
     reality,
     repo,
     sni,
+    sysinfo,
+    tgbot,
     updates,
     xray,
+    xraycheck,
 )
 from .server import (
     ROUTES,
@@ -208,12 +211,59 @@ def revoke_sessions(req: Request) -> Response:
 # --------------------------------------------------------------------------
 
 
+def _metrics_payload(node_id: int, minutes: int = 60) -> dict[str, Any]:
+    items = repo.metrics_series(node_id, minutes)
+    series = []
+    for item in items:
+        total = to_int(item.get("mem_total"))
+        used = to_int(item.get("mem_used"))
+        series.append(
+            {
+                "ts": item["ts"],
+                "cpu": round(float(item.get("cpu") or 0), 1),
+                "mem": round(used * 100 / total, 1) if total else 0.0,
+                "mem_used": used,
+                "mem_total": total,
+                "load1": round(float(item.get("load1") or 0), 2),
+            }
+        )
+    return {"node_id": node_id, "minutes": minutes, "series": series,
+            "current": series[-1] if series else None}
+
+
+@get("/api/metrics")
+def metrics_index(req: Request) -> Response:
+    node_id = to_int(req.q("node_id"), repo.PANEL_METRICS_ID)
+    minutes = max(5, min(to_int(req.q("minutes"), 60), 24 * 60))
+    data = _metrics_payload(node_id, minutes)
+    if node_id == repo.PANEL_METRICS_ID:
+        data["host"] = sysinfo.host_snapshot()
+    else:
+        node = repo.get_node(node_id)
+        if node is None:
+            raise ApiError(404, "Нода не найдена")
+        data["host"] = {
+            "name": node["name"],
+            "cpu": (repo.latest_metrics(node_id) or {}).get("cpu", 0.0),
+            "mem_used": to_int(node["mem_used"]),
+            "mem_total": to_int(node["mem_total"]),
+            "load1": node["load1"],
+            "uptime": to_int(node["uptime_seconds"]),
+        }
+    return json_response(data)
+
+
 @get("/api/dashboard")
 def dashboard(req: Request) -> Response:
     data = repo.dashboard(req.base_url())
     data["panel"] = _settings_label()
     data["admin"] = req.admin
     data["nodes"]["base_url"] = req.base_url()
+    data["system"] = _metrics_payload(repo.PANEL_METRICS_ID, 60)
+    data["system"]["host"] = sysinfo.host_snapshot()
+    data["nodes"]["metrics"] = {
+        str(node["id"]): repo.latest_metrics(node["id"]) for node in data["nodes"]["items"]
+    }
     return json_response(data)
 
 
@@ -627,13 +677,41 @@ def nodes_probe(req: Request) -> Response:
     return json_response(result)
 
 
-@get(r"/api/nodes/(?P<node_id>\d+)/config")
-def nodes_config(req: Request) -> Response:
-    row = _node_or_404(req.params["node_id"])
+def node_config_payload(row) -> tuple[dict[str, Any], list[str]]:
+    """Собрать конфиг ноды и проверить его по схеме ядра Xray."""
     users = repo.node_traffic_users(row["id"])
     data = xray.build_config(
         row, users, db.get_settings(), repo.list_outbounds(with_secrets=True)
     )
+    return data, xraycheck.validate_config(data)
+
+
+@get(r"/api/nodes/(?P<node_id>\d+)/actions")
+def node_actions_index(req: Request) -> Response:
+    row = _node_or_404(req.params["node_id"])
+    return json_response({"items": repo.list_node_commands(row["id"])})
+
+
+@post(r"/api/nodes/(?P<node_id>\d+)/actions")
+def node_actions_create(req: Request) -> Response:
+    row = _node_or_404(req.params["node_id"])
+    action = str((req.json() or {}).get("action") or "").strip()
+    if action not in repo.NODE_COMMANDS:
+        raise ApiError(400, "Неизвестное действие")
+    actor = req.admin["username"] if req.admin else ""
+    command_id = repo.create_node_command(row["id"], action, actor)
+    _audit(req, f"node.action.{action}", row["name"])
+    return json_response(
+        {"ok": True, "id": command_id, "action": action,
+         "title": repo.NODE_COMMANDS[action], "status": "pending"},
+        status=201,
+    )
+
+
+@get(r"/api/nodes/(?P<node_id>\d+)/config")
+def nodes_config(req: Request) -> Response:
+    row = _node_or_404(req.params["node_id"])
+    data, _problems = node_config_payload(row)
     body = json.dumps(data, ensure_ascii=False, indent=2)
     headers = {}
     if req.q("download") == "1":
@@ -992,9 +1070,9 @@ def _config_revision(node_id: int, users) -> str:
 def agent_config(req: Request) -> Response:
     node = _agent_node(req)
     users = repo.node_traffic_users(node["id"])
-    config_data = xray.build_config(
-        node, users, db.get_settings(), repo.list_outbounds(with_secrets=True)
-    )
+    config_data, problems = node_config_payload(node)
+    if problems:
+        repo.update_node(node["id"], {"last_error": "схема конфига: " + "; ".join(problems)[:360]})
     repo.touch_node(node["id"])
     return json_response(
         {
@@ -1011,8 +1089,25 @@ def agent_config(req: Request) -> Response:
             "api_port": xray.API_PORT,
             "poll_interval": config.AGENT_POLL_SECONDS,
             "config": config_data,
+            "problems": problems,
+            "commands": repo.node_commands_queue(node["id"]),
         }
     )
+
+
+@post("/api/agent/command", auth_required=False)
+def agent_command_result(req: Request) -> Response:
+    node = _agent_node(req)
+    payload = req.json()
+    command_id = to_int(payload.get("id"))
+    if not command_id:
+        raise ApiError(400, "Не указан id команды")
+    row = db.one("SELECT * FROM node_commands WHERE id = ? AND node_id = ?", (command_id, node["id"]))
+    if row is None:
+        raise ApiError(404, "Команда не найдена")
+    repo.finish_node_command(command_id, str(payload.get("status") or "done"),
+                             str(payload.get("result") or ""))
+    return json_response({"ok": True})
 
 
 @post("/api/agent/heartbeat", auth_required=False)
@@ -1378,6 +1473,88 @@ def updates_apply(req: Request) -> Response:
 @get("/api/updates/status")
 def updates_status(req: Request) -> Response:
     return json_response(updates.status())
+
+
+
+# --------------------------------------------------------------------------
+# Telegram-бот для продажи подписок
+# --------------------------------------------------------------------------
+
+
+def _bot_payload() -> dict[str, Any]:
+    conf = tgbot.settings()
+    token = conf.pop("token", "")
+    return {
+        "settings": {
+            **conf,
+            "token_set": bool(token),
+            "token_hint": f"…{token[-4:]}" if len(token) > 8 else "",
+        },
+        "status": tgbot.status(),
+        "orders": tgbot.list_orders(20),
+    }
+
+
+@get("/api/bot")
+def bot_index(req: Request) -> Response:
+    return json_response(_bot_payload())
+
+
+@patch("/api/bot")
+def bot_update(req: Request) -> Response:
+    payload = req.json() or {}
+    if "token" in payload and not str(payload.get("token") or "").strip():
+        payload.pop("token")  # пустое поле = оставить прежний токен
+    tgbot.save_settings(payload)
+    if payload.get("token"):
+        try:
+            info = tgbot.bot_info(str(payload["token"]))
+            db.update_settings({"bot_username": info["username"]})
+        except Exception as exc:  # токен мог быть неверным
+            raise ApiError(400, f"Telegram отклонил токен: {exc}") from exc
+    tgbot.restart_worker()
+    _audit(req, "bot.update", "telegram")
+    return json_response(_bot_payload())
+
+
+@post("/api/bot/test")
+def bot_test(req: Request) -> Response:
+    conf = tgbot.settings()
+    try:
+        info = tgbot.bot_info(conf["token"])
+    except Exception as exc:
+        raise ApiError(400, f"Не удалось подключиться к Telegram: {exc}") from exc
+    db.update_settings({"bot_username": info["username"], "bot_last_error": ""})
+    return json_response({"ok": True, "username": info["username"], "name": info["name"]})
+
+
+@post("/api/bot/restart")
+def bot_restart(req: Request) -> Response:
+    tgbot.restart_worker()
+    _audit(req, "bot.restart", "telegram")
+    return json_response({"ok": True, "status": tgbot.status()})
+
+
+@get("/api/bot/orders")
+def bot_orders(req: Request) -> Response:
+    return json_response({"items": tgbot.list_orders(50), "stats": tgbot.orders_stats()})
+
+
+@post(r"/api/bot/orders/(?P<order_id>\d+)")
+def bot_order_action(req: Request) -> Response:
+    order_id = to_int(req.params["order_id"])
+    action = str((req.json() or {}).get("action") or "").strip()
+    if action == "approve":
+        paid = tgbot.mark_paid(order_id)
+        if paid is None:
+            raise ApiError(404, "Заказ не найден")
+        _audit(req, "bot.order.approve", str(order_id))
+        return json_response({"ok": True, "order": paid, "access": paid.get("access") or {}})
+    if action == "deny":
+        tgbot.deny_order(order_id)
+        _audit(req, "bot.order.deny", str(order_id))
+        return json_response({"ok": True})
+    raise ApiError(400, "Неизвестное действие")
 
 
 # --------------------------------------------------------------------------

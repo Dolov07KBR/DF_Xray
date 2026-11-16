@@ -7,7 +7,7 @@ import { openNodeForm } from './nodes.js';
 import { openRealityScanner } from './scanner.js';
 
 const PROTOCOL_TITLES = { vless: 'VLESS', vmess: 'VMess', trojan: 'Trojan' };
-const TRANSPORT_TITLES = { tcp: 'TCP', ws: 'WebSocket', grpc: 'gRPC', xhttp: 'XHTTP', h2: 'HTTP/2' };
+const TRANSPORT_TITLES = { tcp: 'TCP', ws: 'WebSocket', grpc: 'gRPC', xhttp: 'XHTTP', httpupgrade: 'HTTPUpgrade' };
 const SECURITY_TITLES = { reality: 'Reality', tls: 'TLS', none: 'Без шифрования' };
 
 function inboundRow(node) {
