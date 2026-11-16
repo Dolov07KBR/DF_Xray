@@ -223,6 +223,14 @@ Python-зависимости.
 | --- | --- |
 | ![Пресеты](docs/screenshots/node-presets.png) | ![SNI](docs/screenshots/sni-panel.png) |
 
+| Метрики панели | Команды агенту |
+| --- | --- |
+| ![Метрики](docs/screenshots/dashboard-metrics.png) | ![Команды](docs/screenshots/nodes-actions.png) |
+
+| Telegram-бот продаж | Разделы панели |
+| --- | --- |
+| ![Бот](docs/screenshots/settings-bot.png) | ![Разделы](docs/screenshots/settings-services.png) |
+
 Скриншоты сняты с демо-данными (`python -m app seed`).
 
 ## Быстрый старт
