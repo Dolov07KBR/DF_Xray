@@ -14,7 +14,7 @@
 set -Eeuo pipefail
 
 APP_NAME="DF_Xray Panel"
-APP_VERSION="1.5.0"
+APP_VERSION="1.5.1"
 REPO="${DFX_REPO:-Dolov07KBR/DF_Xray}"
 DEFAULT_REF="${DFX_REF:-main}"
 INSTALL_DIR="${DFX_INSTALL_DIR:-/opt/dfxray}"
@@ -337,6 +337,22 @@ fetch_sources() {
     ok "Исходники загружены в $INSTALL_DIR"
 }
 
+# Код должен принадлежать пользователю панели (uid 1000 в образе), иначе кнопка
+# «Обновить» из интерфейса не сможет переписать файлы.
+grant_self_update() {
+    [ "${SELF_UPDATE:-1}" = "1" ] || return 0
+    [ "$(id -u)" = "0" ] || return 0
+    local paths=(app static node bin docs install.sh docker-compose.yml \
+                 docker-compose.selfupdate.yml Dockerfile pyproject.toml Makefile README.md LICENSE)
+    local item present=()
+    for item in "${paths[@]}"; do
+        [ -e "$INSTALL_DIR/$item" ] && present+=("$INSTALL_DIR/$item")
+    done
+    [ ${#present[@]} -gt 0 ] || return 0
+    chown -R 1000:1000 "${present[@]}" 2>/dev/null || true
+    info "Права на код переданы uid 1000 — самообновление из панели включено"
+}
+
 # ---------------------------------------------------------------- конфигурация ---
 read_existing_env() {
     if [ -f "$INSTALL_DIR/.env" ]; then
@@ -528,6 +544,7 @@ compose() {
 start_stack() {
     step "Сборка и запуск"
     cd "$INSTALL_DIR"
+    grant_self_update
     info "Собираю образ панели (первый раз это занимает 1–2 минуты)"
     compose build panel
     compose up -d panel

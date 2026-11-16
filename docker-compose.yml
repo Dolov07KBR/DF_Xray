@@ -68,8 +68,10 @@ services:
       DFX_NODE_TOKEN: "${NODE_TOKEN:-}"
       DFX_POLL: "${NODE_POLL:-30}"
       DFX_LOG_LEVEL: "${NODE_LOG_LEVEL:-info}"
+      # Порт, который публикуется наружу: Xray внутри слушает ровно его же.
+      XRAY_PORT: "${NODE_PORT:-443}"
     ports:
-      - "${NODE_PORT:-443}:443"
+      - "${NODE_PORT:-443}:${NODE_PORT:-443}"
     volumes:
       - node-de-config:/etc/xray
     networks: [dfxray]
@@ -89,6 +91,7 @@ services:
   #   environment:
   #     DFX_PANEL_URL: "${PANEL_INTERNAL_URL:-http://panel:8000}"
   #     DFX_NODE_TOKEN: "${NODE_TOKEN_NL:-}"
+  #     XRAY_PORT: "8443"
   #   ports:
   #     - "8443:8443"
   #   volumes:

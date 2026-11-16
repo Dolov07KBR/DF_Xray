@@ -55,6 +55,9 @@ function cardHtml(node) {
         <div class="nc-stat"><span>Агент</span><b style="font-size:11.5px">${node.agent_version ? esc(node.agent_version) : '—'}</b></div>
       </div>
       ${error ? `<div class="nc-error" title="${esc(error)}">${icon('alert')}<span>${esc(error)}</span></div>` : ''}
+      ${node.port_mismatch ? `<div class="nc-warn" title="Клиенты подключаются не туда">
+        ${icon('alert')}<span>Xray слушает <b>${node.xray_port}</b>, а в ссылках <b>${node.port}</b>.
+        Поправьте порт ноды или <code class="mono">XRAY_PORT</code> на сервере.</span></div>` : ''}
       <div class="nc-foot">
         <button class="btn btn-sm btn-primary" data-act="connect" data-id="${node.id}">${icon('bolt')}Подключить</button>
         <button class="btn btn-sm" data-act="config" data-id="${node.id}">${icon('terminal')}Конфиг</button>

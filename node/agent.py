@@ -39,13 +39,17 @@ CONFIG_PATH = os.environ.get("DFX_CONFIG_PATH", "/etc/xray/config.json")
 POLL = int(os.environ.get("DFX_POLL", "30"))
 DRY_RUN = os.environ.get("DFX_DRY_RUN", "0") in ("1", "true", "yes")
 STATS_API = os.environ.get("DFX_STATS_API", "127.0.0.1:10085")
+# Порт, который реально опубликован у контейнера/фаервола. Если панель прислала
+# другую цифру, приводим inbound к этому порту — иначе клиенты бьются в закрытую дверь.
+FORCED_PORT = int(os.environ.get("XRAY_PORT") or os.environ.get("DFX_XRAY_PORT") or "0")
 LOG_LEVEL = os.environ.get("DFX_LOG_LEVEL", "info").lower()
 
 STOP = False
 
-AGENT_VERSION = "1.5.0"
+AGENT_VERSION = "1.5.1"
 APPLIED_REVISION = ""
 LAST_ERROR = ""
+APPLIED_PORT = 0
 
 
 def log(message: str, level: str = "info") -> None:
@@ -151,6 +155,7 @@ def system_metrics() -> dict:
         metrics["xray_running"] = xray.is_running()
     metrics["revision"] = APPLIED_REVISION
     metrics["last_error"] = LAST_ERROR
+    metrics["xray_port"] = APPLIED_PORT
     return metrics
 
 
@@ -354,6 +359,9 @@ def run_command(command: str) -> tuple[str, str]:
             return "done", "Xray перезапущен"
         if name == "test_config":
             ok, message = xray.test_config(CONFIG_PATH)
+            missing = "" if ok else ", ".join(missing_certificate_paths(CONFIG_PATH))
+            if missing:
+                return "error", f"нет файлов сертификата: {missing}"[:300]
             return ("done" if ok else "error"), (message or "конфиг корректен")[:300]
         if name == "restart_agent":
             log("перезапуск агента по команде панели")
@@ -377,10 +385,61 @@ def send_command_result(command_id: int, status: str, result: str) -> None:
         log(f"не удалось отправить результат команды {command_id}: {exc}", "warn")
 
 
+def align_port(config: dict) -> dict:
+    """Привести порт inbound'ов к опубликованному (XRAY_PORT), если он задан."""
+    if not FORCED_PORT:
+        return config
+    inbounds = config.get("inbounds")
+    if not isinstance(inbounds, list):
+        return config
+    for inbound in inbounds:
+        if not isinstance(inbound, dict):
+            continue
+        tag = str(inbound.get("tag") or "")
+        if tag == "api":
+            continue
+        if int(inbound.get("port") or 0) != FORCED_PORT:
+            log(f"порт inbound «{tag}» {inbound.get('port')} → {FORCED_PORT} (XRAY_PORT)", "warn")
+            inbound["port"] = FORCED_PORT
+    return config
+
+
+def missing_certificates(config: dict) -> list[str]:
+    """Файлы сертификатов, которых нет на диске (частая причина «порт закрыт»)."""
+    missing: list[str] = []
+    for inbound in config.get("inbounds") or []:
+        stream = (inbound or {}).get("streamSettings") or {}
+        if stream.get("security") != "tls":
+            continue
+        for cert in (stream.get("tlsSettings") or {}).get("certificates") or []:
+            for key in ("certificateFile", "keyFile"):
+                path = str((cert or {}).get(key) or "")
+                if path and not os.path.isfile(path):
+                    missing.append(path)
+    return missing
+
+
+def missing_certificate_paths(config_path: str) -> list[str]:
+    """То же самое, но по конфигу на диске — для команды test_config."""
+    try:
+        with open(config_path, encoding="utf-8") as handle:
+            return missing_certificates(json.load(handle))
+    except (OSError, ValueError):
+        return []
+
+
 def apply_config(config: dict) -> bool:
-    global LAST_ERROR
+    global LAST_ERROR, APPLIED_PORT
     if not write_config(config, CONFIG_PATH):
         LAST_ERROR = f"не удалось записать {CONFIG_PATH}"
+        return False
+    missing = missing_certificates(config)
+    if missing:
+        LAST_ERROR = (
+            "нет файлов сертификата: " + ", ".join(sorted(set(missing)))
+            + " — выпустите сертификат (certbot) или переключите ноду на Reality"
+        )[:400]
+        log(LAST_ERROR, "error")
         return False
     ok, message = xray.test_config(CONFIG_PATH)
     if not ok:
@@ -390,6 +449,8 @@ def apply_config(config: dict) -> bool:
     log("конфиг проверен и обновлён")
     xray.restart()
     LAST_ERROR = ""
+    inbounds = config.get("inbounds") or []
+    APPLIED_PORT = int(inbounds[0].get("port") or 0) if inbounds else 0
     return True
 
 
@@ -434,7 +495,7 @@ def loop() -> int:
                     return 0
 
             if new_revision != revision or not os.path.isfile(CONFIG_PATH):
-                if apply_config(payload.get("config") or {}):
+                if apply_config(align_port(payload.get("config") or {})):
                     revision = new_revision
                     APPLIED_REVISION = new_revision
                 else:

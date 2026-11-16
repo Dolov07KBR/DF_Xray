@@ -9,16 +9,14 @@ from __future__ import annotations
 import base64
 import json
 import os
-import shutil
 import socket
-import subprocess
-import tempfile
 import time
 import urllib.parse
 from collections.abc import Iterable
 from typing import Any
 
-from .utils import b64url, to_bool, to_int
+from . import x25519
+from .utils import to_bool, to_int
 
 API_PORT = 10085
 API_LISTEN = f"127.0.0.1:{API_PORT}"
@@ -527,42 +525,18 @@ def _der_tail(raw: bytes, size: int = 32) -> bytes:
 
 
 def generate_reality_keypair() -> tuple[str, str]:
-    """Сгенерировать пару x25519 через openssl (как `xray x25519`)."""
-    openssl = shutil.which("openssl")
-    if not openssl:
-        raise RuntimeError(
-            "openssl не найден в системе. Сгенерируйте ключи командой "
-            "`xray x25519` и впишите их вручную."
-        )
-    with tempfile.TemporaryDirectory() as tmp:
-        key_path = os.path.join(tmp, "reality.pem")
-        der_path = os.path.join(tmp, "reality.der")
-        try:
-            subprocess.run(
-                [openssl, "genpkey", "-algorithm", "X25519", "-out", key_path],
-                check=True,
-                capture_output=True,
-                timeout=20,
-            )
-            subprocess.run(
-                [openssl, "pkey", "-in", key_path, "-outform", "DER", "-out", der_path],
-                check=True,
-                capture_output=True,
-                timeout=20,
-            )
-            with open(der_path, "rb") as handle:
-                private_raw = handle.read()
-            pub_der = subprocess.run(
-                [openssl, "pkey", "-in", key_path, "-pubout", "-outform", "DER"],
-                check=True,
-                capture_output=True,
-                timeout=20,
-            ).stdout
-        except (subprocess.SubprocessError, OSError) as exc:
-            raise RuntimeError(f"Не удалось сгенерировать ключи: {exc}") from exc
-    private_key = b64url(_der_tail(private_raw))
-    public_key = b64url(_der_tail(pub_der))
-    return private_key, public_key
+    """Сгенерировать пару X25519 в формате `xray x25519` (private, public).
+
+    Считается на чистом Python: openssl и бинарь xray не нужны, поэтому ключи
+    создаются автоматически при добавлении ноды и в контейнере, и на VPS.
+    """
+    return x25519.generate()
+
+
+def generate_short_id(length: int = 8) -> str:
+    """Случайный shortId для Reality: hex, чётная длина (Xray требование)."""
+    length = max(2, min(16, length + length % 2))
+    return os.urandom(length // 2).hex()
 
 
 # --------------------------------------------------------------------------

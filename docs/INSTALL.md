@@ -176,6 +176,19 @@ sudo dfxray update            # те же флаги, что при устано
 Если панель запущена не в Docker, укажите свою команду обновления в переменной
 `DFX_UPDATE_COMMAND` — она будет выполнена при нажатии «Обновить».
 
+Что нужно для самообновления: каталог кода должен быть писабельным для процесса
+панели (`install.sh` делает `chown -R 1000:1000` на код при установке). Панель
+обновляет файлы нативно (без docker и без установщика) и сама перезапускает
+контейнер через restart policy. Если обновиться изнутри нельзя, раздел
+«Обновление» покажет причину и команду для сервера с кнопкой «Копировать»:
+
+```bash
+cd /opt/dfxray && sudo chown -R 1000:1000 app static node install.sh \
+  docker-compose.yml docker-compose.selfupdate.yml Dockerfile pyproject.toml \
+  Makefile README.md LICENSE && sudo docker compose \
+  -f docker-compose.yml -f docker-compose.selfupdate.yml up -d panel
+```
+
 ## Удаление
 
 ```bash

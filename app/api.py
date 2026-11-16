@@ -505,6 +505,29 @@ def _node_payload(payload: dict[str, Any], *, fill: bool = True) -> dict[str, An
     prepared = nodecfg.decorate(data)
     nodecfg.require_sni(prepared)
     nodecfg.validate(prepared)
+    prepared = _auto_node_secrets(prepared)
+    return prepared
+
+
+def _auto_node_secrets(data: dict[str, Any]) -> dict[str, Any]:
+    """Достроить секреты ноды, чтобы ничего не приходилось вводить руками.
+
+    Reality: пара X25519 и shortId считаются на чистом Python — openssl и
+    установленный xray не нужны. Порт: если не задан, берём дефолт пресета
+    или 443.
+    """
+    prepared = dict(data)
+    if str(prepared.get("security") or "").lower() == "reality":
+        if not str(prepared.get("private_key") or "").strip():
+            private_key, public_key = xray.generate_reality_keypair()
+            prepared["private_key"] = private_key
+            prepared["public_key"] = public_key
+        if not str(prepared.get("short_id") or "").strip():
+            prepared["short_id"] = xray.generate_short_id(8)
+    if not str(prepared.get("short_id") or "").strip():
+        prepared["short_id"] = xray.generate_short_id(8)
+    if not prepared.get("port"):
+        prepared["port"] = 443
     return prepared
 
 
@@ -586,6 +609,13 @@ def nodes_update(req: Request) -> Response:
     ):
         merged["flow"] = ""
         payload["flow"] = ""
+    # Переключили ноду на Reality (или очистили ключи) — достраиваем секреты,
+    # чтобы конфиг оставался валидным без ручного ввода.
+    ensured = _auto_node_secrets(merged)
+    for key in ("private_key", "public_key", "short_id"):
+        if ensured.get(key) and ensured.get(key) != merged.get(key):
+            payload[key] = ensured[key]
+            merged[key] = ensured[key]
     try:
         nodecfg.validate(merged)
         repo.update_node(row["id"], payload)

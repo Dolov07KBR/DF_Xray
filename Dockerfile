@@ -14,7 +14,7 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-RUN addgroup -S dfxray && adduser -S -G dfxray -h /app dfxray \
+RUN addgroup -g 1000 -S dfxray && adduser -u 1000 -S -G dfxray -h /app dfxray \
  && mkdir -p /data && chown -R dfxray:dfxray /data
 
 COPY app ./app

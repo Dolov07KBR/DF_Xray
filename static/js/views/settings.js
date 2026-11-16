@@ -237,10 +237,14 @@ function sectionHtml(id, settings) {
             <a class="btn" href="https://github.com/Dolov07KBR/DF_Xray/releases" target="_blank" rel="noopener">${icon('external')}Релизы</a>
           </div>
           <pre class="code-block update-log" id="update-log" hidden></pre>
-          <p class="hint" style="margin-top:12px;line-height:1.7" id="update-hint">
-            Автообновление работает, если у панели есть доступ к установщику или Docker.
-            На VPS без этого доступна команда <code class="mono">dfxray update</code>.
-          </p>
+          <div id="update-reason" class="notice warn" style="margin-top:12px" hidden></div>
+          <div id="update-manual" style="margin-top:12px" hidden>
+            <p class="hint" style="margin-bottom:6px">Выполните на сервере:</p>
+            <div class="sub-url-row">
+              <input class="input mono" id="update-command" readonly>
+              <button class="btn btn-sm" type="button" data-act="copy-update">${icon('copy')}Копировать</button>
+            </div>
+          </div>
         </div>
       </div>
       <div class="card" style="margin-top:16px">
@@ -339,12 +343,27 @@ function paintUpdate(container, data) {
   } else if (notes) {
     notes.innerHTML = '';
   }
+  const reason = container.querySelector('#update-reason');
+  const manual = container.querySelector('#update-manual');
+  const command = container.querySelector('#update-command');
+  const canApply = Boolean(data.update_available) && capability.mode !== 'manual';
   if (applyBtn) {
-    const canApply = Boolean(data.update_available) && capability.mode !== 'manual';
     applyBtn.disabled = !canApply;
-    applyBtn.title = canApply
-      ? (capability.hint || 'Запустить обновление')
-      : 'Автообновление недоступно — обновите панель на сервере';
+    applyBtn.title = !data.update_available
+      ? 'Установлена последняя версия'
+      : canApply
+        ? (capability.hint || 'Запустить обновление')
+        : 'Автообновление недоступно — скопируйте команду ниже';
+  }
+  if (reason) {
+    const text = capability.reason || (capability.mode === 'manual' ? capability.hint : '');
+    reason.hidden = !text;
+    if (text) reason.textContent = `${text}.`;
+  }
+  if (manual) {
+    const cmd = capability.instructions || '';
+    manual.hidden = capability.mode !== 'manual' || !cmd;
+    if (command) command.value = cmd;
   }
   if (data.status) paintUpdateLog(container, data.status);
   void current;
@@ -491,6 +510,11 @@ export async function render(container, ctx) {
         toast(`Завершено сессий: ${result.removed}`);
       } else if (action.dataset.act === 'check-update') {
         await runUpdateCheck(container, action);
+      } else if (action.dataset.act === 'copy-update') {
+        const field = container.querySelector('#update-command');
+        if (field && field.value) {
+          await copy(field.value, 'Команда скопирована');
+        }
       } else if (action.dataset.act === 'apply-update') {
         await runUpdateApply(container, action);
       } else if (action.dataset.act === 'totp-enable') {

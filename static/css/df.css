@@ -1002,6 +1002,13 @@ tr:hover .row-actions { opacity: 1; }
   border-radius: 9px; padding: 7px 9px;
 }
 .nc-error svg { width: 14px; height: 14px; flex: 0 0 auto; margin-top: 1px; }
+.nc-warn {
+  display: flex; align-items: flex-start; gap: 7px;
+  font-size: 11.5px; line-height: 1.45; color: #ffc687;
+  background: rgba(255, 180, 84, .07); border: 1px solid rgba(255, 180, 84, .22);
+  border-radius: 9px; padding: 7px 9px;
+}
+.nc-warn svg { width: 14px; height: 14px; flex: 0 0 auto; margin-top: 1px; }
 .nc-error span { overflow: hidden; text-overflow: ellipsis; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
 
 .toolbar-wrap { flex-wrap: wrap; }

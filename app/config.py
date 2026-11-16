@@ -10,7 +10,7 @@ import os
 import pathlib
 
 APP_NAME = "DF_Xray Panel"
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.5.1"
 API_VERSION = 1
 
 ROOT_DIR = pathlib.Path(__file__).resolve().parent.parent

@@ -225,7 +225,13 @@ def check(force: bool = False) -> dict[str, Any]:
 
 
 def install_dir() -> pathlib.Path:
-    raw = db.get_setting("install_dir", "/opt/dfxray") or "/opt/dfxray"
+    """Каталог установки: настройка панели, переменная окружения или /opt/dfxray."""
+    raw = ""
+    try:
+        raw = str(db.get_setting("install_dir", "") or "")
+    except Exception:  # база может быть ещё не инициализирована (CLI, тесты)
+        raw = ""
+    raw = (raw or os.environ.get("DFX_HOME", "") or "/opt/dfxray").strip()
     return pathlib.Path(raw)
 
 
@@ -241,39 +247,100 @@ def _docker_available() -> bool:
     return probe.returncode == 0
 
 
-def self_capable() -> bool:
-    """Может ли панель обновить собственный код в смонтированном каталоге."""
-    if os.environ.get(SELF_MARKER) != "1":
+def code_dir() -> pathlib.Path:
+    """Каталог, из которого запущен код панели (родитель пакета app)."""
+    return pathlib.Path(__file__).resolve().parent.parent
+
+
+def _writable(path: pathlib.Path) -> bool:
+    marker = path / "app"
+    if not marker.is_dir():
         return False
-    target = pathlib.Path(SELF_TARGET)
-    return (target / "app").is_dir() and os.access(target, os.W_OK)
+    try:
+        probe = path / ".dfx-write-test"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink()
+        return True
+    except OSError:
+        return bool(os.access(path, os.W_OK))
+
+
+def in_container() -> bool:
+    return pathlib.Path("/.dockerenv").exists() or pathlib.Path("/run/.containerenv").exists()
+
+
+def supervised() -> bool:
+    """Перезапустит ли нас супервизор (Docker, systemd) после выхода из процесса."""
+    if os.environ.get("DFX_SUPERVISED") == "1":
+        return True
+    return in_container() or bool(os.environ.get("INVOCATION_ID"))
+
+
+def self_target() -> pathlib.Path:
+    """Куда писать обновление: смонтированный каталог установки или свой код."""
+    if os.environ.get(SELF_MARKER) == "1":
+        return pathlib.Path(SELF_TARGET)
+    return code_dir()
+
+
+def self_capable() -> bool:
+    """Может ли панель обновить свой код сама (без docker и установщика)."""
+    return _writable(self_target())
+
+
+CODE_PATHS = "app static node bin docs install.sh docker-compose.yml docker-compose.selfupdate.yml Dockerfile pyproject.toml Makefile README.md LICENSE"
+
+
+def manual_command() -> str:
+    """Команда, которую пользователь может скопировать и выполнить на сервере."""
+    target = install_dir()
+    marker = os.environ.get(SELF_MARKER) == "1"
+    if marker:
+        # Права на смонтированный код: панель в контейнере работает под uid 1000.
+        return (
+            f"cd {target} && sudo chown -R 1000:1000 {CODE_PATHS} && "
+            "sudo docker compose -f docker-compose.yml -f docker-compose.selfupdate.yml "
+            "up -d panel"
+        )
+    if (target / "docker-compose.yml").is_file():
+        return f"cd {target} && sudo docker compose pull && sudo docker compose up -d"
+    return f"cd {target} && sudo ./install.sh --yes"
 
 
 def capability() -> dict[str, Any]:
-    """Что панель умеет делать с обновлением в текущем окружении."""
+    """Что панель умеет делать с обновлением и что показать пользователю."""
+    target = install_dir()
+    instructions = manual_command()
     if self_capable():
+        where = self_target()
         return {
             "mode": "self",
             "label": "Самообновление",
-            "command": f"python -m app self-update --target {SELF_TARGET}",
-            "hint": f"Код панели смонтирован из {SELF_TARGET}",
+            "command": f"python -m app self-update --target {where}",
+            "hint": f"Код панели обновляется на месте: {where}",
+            "instructions": instructions,
         }
-    custom = (db.get_setting("update_command", "") or os.environ.get("DFX_UPDATE_COMMAND", "")).strip()
-    target = install_dir()
-    script = target / "install.sh"
+    try:
+        stored = str(db.get_setting("update_command", "") or "")
+    except Exception:
+        stored = ""
+    custom = (stored or os.environ.get("DFX_UPDATE_COMMAND", "")).strip()
     if custom:
         return {
             "mode": "command",
             "label": "Команда обновления",
             "command": custom,
             "hint": "Задана в настройках панели",
+            "instructions": instructions,
         }
-    if script.is_file():
+    script = target / "install.sh"
+    if script.is_file() and shutil.which("bash") and os.geteuid() == 0:
         return {
             "mode": "installer",
             "label": "Установщик",
             "command": f"bash {script} --dir {target} --yes",
             "hint": f"Найден {script}",
+            "instructions": instructions,
         }
     if _docker_available() and (target / "docker-compose.yml").is_file():
         return {
@@ -286,12 +353,29 @@ def capability() -> dict[str, Any]:
                 "up -d panel"
             ),
             "hint": "Пересборка контейнера из каталога установки",
+            "instructions": instructions,
         }
+    # Объясняем причину, а не просто «недоступно».
+    if os.environ.get(SELF_MARKER) == "1":
+        reason = (
+            f"Код смонтирован из {target}, но контейнер не может туда писать: "
+            "файлы принадлежат root, а панель работает под uid 1000. "
+            "Один раз выполните команду ниже — дальше кнопка заработает"
+        )
+    elif in_container():
+        reason = (
+            "Панель работает в контейнере без монтирования кода, поэтому обновить "
+            "файлы изнутри нельзя. Обновите контейнер на сервере"
+        )
+    else:
+        reason = "Каталог панели недоступен для записи"
     return {
         "mode": "manual",
         "label": "Вручную на сервере",
         "command": "",
-        "hint": "Автообновление недоступно: панель запущена без доступа к установщику",
+        "hint": reason,
+        "reason": reason,
+        "instructions": instructions,
     }
 
 
@@ -382,6 +466,41 @@ def _append_log(text: str) -> None:
         _STATE["log"] = (_STATE["log"] + text)[-MAX_LOG:]
 
 
+def _run_native(target: pathlib.Path) -> None:
+    """Обновить код панели на месте (без docker и внешних команд)."""
+    with _LOCK:
+        _STATE.update(
+            {
+                "running": True,
+                "ok": None,
+                "log": f"$ python -m app self-update --target {target}\n",
+                "command": f"self-update --target {target}",
+                "started_at": time.time(),
+                "finished_at": 0.0,
+            }
+        )
+    try:
+        _append_log("Скачиваю свежие исходники с GitHub…\n")
+        result = self_update(target=str(target))
+        _append_log(f"Файлов обновлено: {result.get('files', 0)} (ref {result.get('ref')})\n")
+        with _LOCK:
+            _STATE["ok"] = True
+            _STATE["finished_at"] = time.time()
+        if supervised():
+            _append_log("Перезапускаю панель…\n")
+            restart_soon(2.5)
+        else:
+            _append_log("Готово. Перезапустите панель: systemctl restart dfxray-panel\n")
+    except Exception as exc:
+        _append_log(f"[ошибка] {exc}\n")
+        with _LOCK:
+            _STATE["ok"] = False
+            _STATE["finished_at"] = time.time()
+    finally:
+        with _LOCK:
+            _STATE["running"] = False
+
+
 def _run(command: str) -> None:
     with _LOCK:
         _STATE.update(
@@ -429,10 +548,15 @@ def start_update() -> dict[str, Any]:
         if _STATE["running"]:
             raise RuntimeError("Обновление уже выполняется")
     info = capability()
-    if info["mode"] == "manual" or not info["command"]:
-        raise RuntimeError(
-            "Автообновление недоступно. Обновите панель на сервере командой dfxray update."
+    if info["mode"] == "manual" or (not info["command"] and info["mode"] != "self"):
+        hint = info.get("reason") or info.get("hint") or "Автообновление недоступно"
+        raise RuntimeError(f"{hint}. Команда на сервере: {info.get('instructions', '')}".strip())
+    if info["mode"] == "self":
+        thread = threading.Thread(
+            target=_run_native, args=(self_target(),), name="dfxray-update", daemon=True
         )
+        thread.start()
+        return {"started": True, "command": info["command"], "mode": "self"}
     thread = threading.Thread(target=_run, args=(info["command"],), name="dfxray-update", daemon=True)
     thread.start()
     return {"started": True, "command": info["command"], "mode": info["mode"]}

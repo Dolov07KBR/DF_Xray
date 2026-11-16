@@ -426,13 +426,16 @@ class PanelTestCase(PanelHarness):
         from app import updates
 
         original = updates.capability
-        updates.capability = lambda: {"mode": "manual", "label": "Вручную", "command": "", "hint": ""}
+        updates.capability = lambda: {
+            "mode": "manual", "label": "Вручную", "command": "", "hint": "",
+            "instructions": "cd /opt/dfxray && sudo ./install.sh --yes",
+        }
         try:
             status, _, data = self.json_request("POST", "/api/updates/apply")
         finally:
             updates.capability = original
         self.assertEqual(status, 400, data)
-        self.assertIn("dfxray update", data.get("error", ""))
+        self.assertIn("install.sh", data.get("error", ""))
 
     # --- мультисервер ---
 

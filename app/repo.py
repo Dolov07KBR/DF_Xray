@@ -430,6 +430,11 @@ def serialize_node(row: sqlite3.Row | dict[str, Any], with_secrets: bool = False
         "cfg_revision": data.get("cfg_revision") or "",
         "applied_at": data.get("applied_at") or "",
         "last_error": data.get("last_error") or "",
+        "xray_port": to_int(data.get("xray_port")),
+        "port_mismatch": bool(
+            to_int(data.get("xray_port"))
+            and to_int(data.get("xray_port")) != to_int(data.get("port"))
+        ),
         "created_at": data.get("created_at") or "",
     }
     if with_secrets:
@@ -643,6 +648,9 @@ def update_node_metrics(node_id: int, payload: dict[str, Any]) -> None:
         with contextlib.suppress(TypeError, ValueError):
             cpu = round(max(0.0, min(100.0, float(payload.get("cpu") or 0))), 1)
             fields["cpu"] = cpu
+    reported_port = to_int(payload.get("xray_port"))
+    if reported_port:
+        fields["xray_port"] = reported_port
     revision = (payload.get("revision") or "").strip()[:40]
     if revision:
         fields["cfg_revision"] = revision

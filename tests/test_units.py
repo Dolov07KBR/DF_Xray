@@ -379,16 +379,79 @@ class SelfUpdateTests(unittest.TestCase):
             (pathlib.Path(tmp) / "app").mkdir()
             os.environ["DFX_SELF_DIR"] = tmp
             updates.SELF_TARGET = tmp
+            previous_target = updates.self_target
             try:
                 os.environ.pop("DFX_SELF_UPDATE", None)
-                self.assertFalse(updates.self_capable())
+                # без маркера обновляем собственный каталог кода (pip/systemd)
+                self.assertTrue(updates.self_capable())
+                self.assertEqual(updates.self_target(), updates.code_dir())
                 os.environ["DFX_SELF_UPDATE"] = "1"
+                updates.self_target = lambda: pathlib.Path(tmp)
                 self.assertTrue(updates.self_capable())
                 cap = updates.capability()
                 self.assertEqual(cap["mode"], "self")
                 self.assertIn("self-update", cap["command"])
+                self.assertIn(tmp, cap["command"])
             finally:
+                updates.self_target = previous_target
                 os.environ.pop("DFX_SELF_UPDATE", None)
+
+    def test_manual_capability_explains_reason(self):
+        import os
+        import tempfile
+
+        from app import updates
+
+        with tempfile.TemporaryDirectory() as tmp:
+            previous = (updates.self_target, updates.install_dir, updates.in_container)
+            updates.self_target = lambda: __import__("pathlib").Path(tmp) / "missing"
+            updates.install_dir = lambda: __import__("pathlib").Path(tmp)
+            updates.in_container = lambda: True
+            try:
+                cap = updates.capability()
+                self.assertEqual(cap["mode"], "manual")
+                self.assertIn("контейнер", cap["hint"])
+                self.assertTrue(cap["instructions"])
+            finally:
+                updates.self_target, updates.install_dir, updates.in_container = previous
+                os.environ.pop("DFX_SELF_UPDATE", None)
+
+
+class X25519Tests(unittest.TestCase):
+    """Ключи Reality считаются на чистом Python — openssl и xray не нужны."""
+
+    def test_rfc7748_vectors(self):
+        from app import x25519
+
+        alice_priv = bytes.fromhex("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a")
+        alice_pub = bytes.fromhex("8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a")
+        bob_priv = bytes.fromhex("5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb")
+        bob_pub = bytes.fromhex("de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f")
+        shared = bytes.fromhex("4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742")
+        self.assertEqual(x25519.public_key(alice_priv), alice_pub)
+        self.assertEqual(x25519.public_key(bob_priv), bob_pub)
+        self.assertEqual(x25519.x25519(alice_priv, bob_pub), shared)
+
+    def test_generate_matches_xray_format(self):
+        from app import x25519
+
+        private_key, public_key = x25519.generate()
+        self.assertEqual(len(private_key), 43)
+        self.assertEqual(len(public_key), 43)
+        self.assertNotIn("=", private_key)
+        self.assertEqual(
+            x25519.b64url(x25519.public_key(x25519.b64url_decode(private_key))), public_key
+        )
+
+    def test_panel_keypair_has_no_external_dependencies(self):
+        from app import xray
+
+        private_key, public_key = xray.generate_reality_keypair()
+        self.assertEqual(len(private_key), 43)
+        self.assertEqual(len(public_key), 43)
+        short_id = xray.generate_short_id(8)
+        self.assertEqual(len(short_id), 8)
+        self.assertTrue(all(ch in "0123456789abcdef" for ch in short_id))
 
 
 class MigrationTests(unittest.TestCase):

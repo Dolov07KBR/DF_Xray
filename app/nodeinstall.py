@@ -28,6 +28,7 @@ def docker_command(url: str, node_token: str, port: int = 443, name: str = "dfxr
             f"  -e DFX_PANEL_URL={_q(url)} \\",
             f"  -e DFX_NODE_TOKEN={_q(node_token)} \\",
             "  -e DFX_POLL=30 \\",
+            f"  -e XRAY_PORT={int(port)} \\",
             f"  -p {int(port)}:{int(port)} \\",
             "  -v dfxray-node:/etc/xray \\",
             "  ghcr.io/dfxray/node:latest",
@@ -44,6 +45,7 @@ def compose_command(url: str, node_token: str, port: int = 443, name: str = "dfx
       DFX_PANEL_URL: "{url}"
       DFX_NODE_TOKEN: "{node_token}"
       DFX_POLL: "30"
+      XRAY_PORT: "{int(port)}"
     ports:
       - "{int(port)}:{int(port)}"
     volumes:
@@ -161,6 +163,7 @@ Environment=DFX_XRAY_BIN=/usr/local/bin/xray
 Environment=DFX_CONFIG_PATH=/etc/xray/config.json
 Environment=DFX_POLL=30
 Environment=DFX_LOG_LEVEL=info
+Environment=XRAY_PORT={int(port)}
 ExecStart=/usr/bin/python3 /opt/dfxray-agent/agent.py
 Restart=always
 RestartSec=5
@@ -173,6 +176,14 @@ UNIT
 systemctl daemon-reload
 systemctl enable dfxray-node >/dev/null 2>&1 || true
 systemctl restart dfxray-node
+
+log "открываю порт $XRAY_PORT в фаерволе"
+if command -v ufw >/dev/null 2>&1; then
+  ufw allow "$XRAY_PORT"/tcp >/dev/null 2>&1 || true
+elif command -v firewall-cmd >/dev/null 2>&1; then
+  firewall-cmd --permanent --add-port="$XRAY_PORT"/tcp >/dev/null 2>&1 || true
+  firewall-cmd --reload >/dev/null 2>&1 || true
+fi
 
 log "жду первый конфиг от панели"
 sleep 4

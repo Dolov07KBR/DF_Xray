@@ -10,7 +10,7 @@ from typing import Any
 
 from . import config
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS settings (
@@ -97,6 +97,7 @@ CREATE TABLE IF NOT EXISTS nodes (
     mem_used      INTEGER NOT NULL DEFAULT 0,
     mem_total     INTEGER NOT NULL DEFAULT 0,
     cpu           REAL NOT NULL DEFAULT 0,
+    xray_port     INTEGER NOT NULL DEFAULT 0,
     cfg_revision  TEXT,
     applied_at    TEXT,
     last_error    TEXT,
@@ -430,6 +431,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
         "cfg_revision": "TEXT",
         "applied_at": "TEXT",
         "last_error": "TEXT",
+        "xray_port": "INTEGER NOT NULL DEFAULT 0",
     }
     for name, ddl in additions.items():
         if name not in node_columns:

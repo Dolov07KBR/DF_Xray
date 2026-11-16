@@ -54,6 +54,68 @@ class NodeCommandTests(_PanelBase):
 
 
 
+class AutoNodeTests(_PanelBase):
+    """Нода должна собираться сама: ключи Reality и shortId без ручного ввода."""
+
+    def test_create_node_generates_reality_keys(self):
+        self.login()
+        status, _, node = self.json_request(
+            "POST",
+            "/api/nodes",
+            {"name": "Auto Reality", "address": "auto.example.com", "preset": "reality-vision"},
+        )
+        self.assertEqual(status, 201, node)
+        self.assertEqual(len(node["public_key"]), 43)
+        self.assertEqual(len(node["private_key"]), 43)
+        self.assertEqual(len(node["short_id"]), 8)
+        status, _, config = self.json_request("GET", f"/api/nodes/{node['id']}/config")
+        self.assertEqual(status, 200, config)
+        reality = config["inbounds"][0]["streamSettings"]["realitySettings"]
+        self.assertEqual(reality["privateKey"], node["private_key"])
+        self.assertEqual(reality["shortIds"], [node["short_id"]])
+
+    def test_patch_switch_to_reality_adds_keys(self):
+        self.login()
+        status, _, node = self.json_request(
+            "POST",
+            "/api/nodes",
+            {"name": "Switch", "address": "switch.example.com", "preset": "plain-tcp"},
+        )
+        self.assertEqual(status, 201, node)
+        status, _, updated = self.json_request(
+            "PATCH",
+            f"/api/nodes/{node['id']}",
+            {"security": "reality", "sni": "www.microsoft.com", "dest": "www.microsoft.com:443",
+             "private_key": "", "public_key": ""},
+        )
+        self.assertEqual(status, 200, updated)
+        self.assertEqual(len(updated["private_key"]), 43)
+        self.assertEqual(len(updated["public_key"]), 43)
+
+    def test_xray_port_mismatch_is_reported(self):
+        self.login()
+        token = self.json_request("GET", "/api/nodes/1")[2]["agent_token"]
+        status, _, _ = self.json_request(
+            "POST",
+            "/api/agent/heartbeat",
+            {"xray_port": 9999, "xray_running": True},
+            headers={"X-Node-Token": token},
+        )
+        self.assertEqual(status, 200)
+        node = self.json_request("GET", "/api/nodes/1")[2]
+        self.assertEqual(node["xray_port"], 9999)
+        self.assertTrue(node["port_mismatch"])
+
+        self.json_request(
+            "POST",
+            "/api/agent/heartbeat",
+            {"xray_port": node["port"], "xray_running": True},
+            headers={"X-Node-Token": token},
+        )
+        node = self.json_request("GET", "/api/nodes/1")[2]
+        self.assertFalse(node["port_mismatch"])
+
+
 class MetricsTests(_PanelBase):
     def test_metrics_endpoint_and_dashboard(self):
         self.login()
