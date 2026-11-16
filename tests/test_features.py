@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import unittest
@@ -85,7 +86,40 @@ class MetricsTests(_PanelBase):
 
 
 
+class TelegramStub:
+    """Подменяет вызовы Telegram API: тесты не должны ходить в сеть."""
+
+    def __init__(self):
+        self.calls = []
+        self.original = None
+
+    def install(self):
+        self.original = tgbot._call
+
+        def _call(method, payload=None, token="", timeout=30):
+            self.calls.append((method, payload or {}))
+            return {}
+
+        tgbot._call = _call
+
+    def restore(self):
+        if self.original is not None:
+            tgbot._call = self.original
+
+    def text(self):
+        return " ".join(str(call[1].get("text") or "") for call in self.calls)
+
+
 class BotTests(_PanelBase):
+    def setUp(self):
+        super().setUp()
+        self.telegram = TelegramStub()
+        self.telegram.install()
+
+    def tearDown(self):
+        self.telegram.restore()
+        super().tearDown()
+
     def test_settings_and_status(self):
         self.login()
         status, _, data = self.json_request("GET", "/api/bot")
@@ -139,9 +173,73 @@ class BotTests(_PanelBase):
         self.assertEqual(record["trial_used"], 1)
         self.assertEqual(record["user_id"], access["user_id"])
 
+    def test_start_shows_menu(self):
+        tgbot.handle_update(
+            {"message": {"chat": {"id": 900100}, "from": {"id": 900100, "username": "buyer"},
+                         "text": "/start"}}
+        )
+        send = [call for call in self.telegram.calls if call[0] == "sendMessage"]
+        self.assertTrue(send)
+        self.assertIn("inline_keyboard", json.dumps(send[0][1], ensure_ascii=False))
 
-if __name__ == "__main__":
-    unittest.main()
+    def test_trial_callback_creates_subscription(self):
+        tgbot.save_settings({"trial_enabled": True, "trial_days": 2, "trial_gb": 5})
+        update = {"callback_query": {
+            "id": "cb1", "data": "trial", "from": {"id": 900200, "username": "trialer"},
+            "message": {"chat": {"id": 900200}, "message_id": 11},
+        }}
+        tgbot.handle_update(update)
+        text = self.telegram.text()
+        self.assertIn("Пробный", text)
+        self.assertIn("/sub/", text)
+        user = db.one("SELECT * FROM users WHERE username = ?", ("tg_trialer",))
+        self.assertIsNotNone(user)
+        # повторный триал не создаёт второго клиента
+        self.telegram.calls.clear()
+        tgbot.handle_update(update)
+        self.assertIn("уже использован", self.telegram.text())
+
+    def test_stars_payment_grants_access(self):
+        tgbot.save_settings({"payment_mode": "stars", "plans": [
+            {"id": "s1", "title": "30 дней", "days": 30, "gb": 100, "price": 0, "stars": 150}
+        ]})
+        order_id = tgbot.create_order(
+            900300, {"id": "s1", "title": "30 дней", "days": 30, "gb": 100, "price": 0, "stars": 150},
+            username="stars_user",
+        )
+        tgbot.handle_pre_checkout({"id": "pc1", "invoice_payload": f"order:{order_id}"})
+        self.assertEqual(self.telegram.calls[-1][0], "answerPreCheckoutQuery")
+        self.assertTrue(self.telegram.calls[-1][1]["ok"])
+
+        tgbot.handle_payment({"chat": {"id": 900300},
+                              "successful_payment": {"invoice_payload": f"order:{order_id}",
+                                                     "total_amount": 150}})
+        saved = tgbot.order(order_id)
+        self.assertEqual(saved["status"], "paid")
+        self.assertTrue(saved["user_id"])
+        self.assertEqual(saved["currency"], "XTR")
+        self.assertIn("/sub/", self.telegram.text())
+
+    def test_manual_order_pending_until_approve(self):
+        tgbot.save_settings({"payment_mode": "manual", "plans": [
+            {"id": "m9", "title": "Ручной", "days": 10, "gb": 20, "price": 300, "stars": 0}
+        ]})
+        tgbot.handle_update({"callback_query": {
+            "id": "cb2", "data": "plan:m9", "from": {"id": 900400, "username": "manual_user"},
+            "message": {"chat": {"id": 900400}, "message_id": 12},
+        }})
+        pending = [row for row in tgbot.list_orders() if row["tg_id"] == 900400]
+        self.assertTrue(pending)
+        order_id = pending[0]["id"]
+        self.assertEqual(pending[0]["status"], "pending")
+        self.assertIsNone(pending[0]["user_id"])
+
+        paid = tgbot.mark_paid(order_id, note="перевод")
+        self.assertIsNotNone(paid)
+        self.assertTrue(paid["user_id"])
+        self.assertTrue(paid["access"]["sub_url"])
+        self.assertEqual(tgbot.order(order_id)["status"], "paid")
+        self.assertEqual(tgbot.order(order_id)["note"], "перевод")
 
 
 class HttpOptimisationTests(_PanelBase):
@@ -169,3 +267,7 @@ class HttpOptimisationTests(_PanelBase):
 # Базовый класс импортирован из test_api — убираем его из пространства имён,
 # иначе unittest соберёт тесты test_api повторно.
 del _PanelBase
+
+
+if __name__ == "__main__":
+    unittest.main()

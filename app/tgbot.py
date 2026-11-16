@@ -341,8 +341,8 @@ def mark_paid(order_id: int, note: str = "") -> dict[str, Any] | None:
     access = grant_access(row["tg_id"], to_int(row["days"]), to_int(row["limit_gb"]),
                           note=note or f"Заказ #{order_id}", username=row["username"])
     db.run(
-        "UPDATE bot_orders SET status = 'paid', user_id = ?, paid_at = ? WHERE id = ?",
-        (access["user_id"], iso(), order_id),
+        "UPDATE bot_orders SET status = 'paid', user_id = ?, paid_at = ?, note = ? WHERE id = ?",
+        (access["user_id"], iso(), str(note or row["note"] or "")[:200], order_id),
     )
     _notify_admin(
         f"💰 Оплачен заказ <b>#{order_id}</b>\n"
