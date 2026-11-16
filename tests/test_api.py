@@ -628,6 +628,87 @@ class PanelTestCase(unittest.TestCase):
         self.assertEqual(updated["health"], "disabled")
         self.json_request("DELETE", f"/api/nodes/{created['id']}")
 
+    # --- автонастройка ноды и каталог SNI ---
+
+    def test_node_presets_and_sni_catalog(self):
+        self.login()
+        status, _, meta = self.json_request("GET", "/api/nodes/meta")
+        self.assertEqual(status, 200, meta)
+        ids = [item["id"] for item in meta["presets"]]
+        self.assertIn("reality-vision", ids)
+        self.assertIn("tls-ws", ids)
+        self.assertGreaterEqual(len(meta["sni"]), 8)
+        self.assertTrue(meta["default_sni"])
+
+        # Создание ноды только по пресету: протокол, транспорт, SNI и dest
+        # подставляет сама панель.
+        status, _, created = self.json_request(
+            "POST",
+            "/api/nodes",
+            {"name": "Пресет-нода", "address": "preset.example.com", "preset": "tls-ws"},
+        )
+        self.assertEqual(status, 201, created)
+        self.assertEqual(created["protocol"], "vless")
+        self.assertEqual(created["transport"], "ws")
+        self.assertEqual(created["security"], "tls")
+        self.assertEqual(created["port"], 8443)
+        self.assertEqual(created["path"], "/dfws")
+        self.assertEqual(created["sni"], "preset.example.com")
+
+        # Несовместимые комбинации отклоняются с понятным текстом.
+        status, _, broken = self.json_request(
+            "POST",
+            "/api/nodes",
+            {"name": "Плохая", "address": "bad.example.com", "preset": "reality-vision",
+             "transport": "ws"},
+        )
+        self.assertEqual(status, 400, broken)
+        self.assertIn("Reality", broken["error"])
+
+        status, _, flow = self.json_request(
+            "POST",
+            "/api/nodes",
+            {"name": "Плохой flow", "address": "flow.example.com", "protocol": "vmess",
+             "transport": "tcp", "security": "tls", "flow": "xtls-rprx-vision"},
+        )
+        self.assertEqual(status, 400, flow)
+
+        status, _, bad_preset = self.json_request(
+            "POST", "/api/nodes", {"name": "x", "address": "x.example.com", "preset": "nope"}
+        )
+        self.assertEqual(status, 400, bad_preset)
+
+        self.json_request("DELETE", f"/api/nodes/{created['id']}")
+
+    def test_sni_catalog_add_and_remove(self):
+        self.login()
+        status, _, listing = self.json_request("GET", "/api/sni")
+        self.assertEqual(status, 200, listing)
+        builtin = {item["domain"] for item in listing["items"] if item["source"] == "builtin"}
+        self.assertIn("www.microsoft.com", builtin)
+
+        status, _, added = self.json_request("POST", "/api/sni", {"domain": "cdn.example.com"})
+        self.assertEqual(status, 201, added)
+        self.assertTrue(added["added"])
+        self.assertIn("cdn.example.com", [item["domain"] for item in added["items"]])
+
+        status, _, again = self.json_request("POST", "/api/sni", {"domain": "https://cdn.example.com/"})
+        self.assertEqual(status, 201, again)
+        self.assertFalse(again["added"])
+        self.assertEqual(
+            [item["domain"] for item in again["items"]].count("cdn.example.com"), 1
+        )
+
+        status, _, bad = self.json_request("POST", "/api/sni", {"domain": "10.0.0.1"})
+        self.assertEqual(status, 400, bad)
+
+        status, _, removed = self.json_request("DELETE", "/api/sni/cdn.example.com")
+        self.assertEqual(status, 200, removed)
+        self.assertNotIn("cdn.example.com", [item["domain"] for item in removed["items"]])
+
+        status, _, missing = self.json_request("DELETE", "/api/sni/cdn.example.com")
+        self.assertEqual(status, 404, missing)
+
     # --- 2FA, API-токены, уведомления, drain и миграция ---
 
     def test_totp_login_flow(self):

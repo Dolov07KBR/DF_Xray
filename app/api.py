@@ -8,7 +8,21 @@ import json
 import re
 from typing import Any
 
-from . import auth, config, db, latency, nodeinstall, notify, qr, reality, repo, updates, xray
+from . import (
+    auth,
+    config,
+    db,
+    latency,
+    nodecfg,
+    nodeinstall,
+    notify,
+    qr,
+    reality,
+    repo,
+    sni,
+    updates,
+    xray,
+)
 from .server import (
     ROUTES,
     ApiError,
@@ -426,10 +440,66 @@ def nodes_index(req: Request) -> Response:
     )
 
 
+def _node_payload(payload: dict[str, Any], *, fill: bool = True) -> dict[str, Any]:
+    """Применить пресет автонастройки, достроить поля и проверить совместимость."""
+    data = dict(payload)
+    preset_id = str(data.pop("preset", "") or "").strip()
+    if preset_id:
+        base = nodecfg.preset(preset_id)
+        for key, value in base.items():
+            if key in ("id", "title", "hint", "badge"):
+                continue
+            data.setdefault(key, value)
+    if not fill:
+        return data
+    prepared = nodecfg.decorate(data)
+    nodecfg.require_sni(prepared)
+    nodecfg.validate(prepared)
+    return prepared
+
+
+@get("/api/nodes/meta")
+def nodes_meta(req: Request) -> Response:
+    """Пресеты автонастройки, совместимость протоколов и каталог SNI."""
+    return json_response(nodecfg.meta())
+
+
+@get("/api/sni")
+def sni_index(req: Request) -> Response:
+    items = sni.catalog()
+    return json_response(
+        {
+            "items": items,
+            "total": len(items),
+            "builtin": len(sni.BUILTIN),
+            "custom": sni.custom(),
+            "default": sni.default(),
+        }
+    )
+
+
+@post("/api/sni")
+def sni_add(req: Request) -> Response:
+    try:
+        result = sni.add_custom(str(req.json().get("domain") or ""))
+    except ValueError as exc:
+        raise ApiError(400, str(exc)) from exc
+    _audit(req, "sni.add", str(result["domain"]))
+    return json_response({**result, "items": sni.catalog()}, status=201)
+
+
+@delete(r"/api/sni/(?P<domain>[^/]+)")
+def sni_delete(req: Request) -> Response:
+    if not sni.remove_custom(req.params["domain"]):
+        raise ApiError(404, "Такого SNI нет в списке")
+    _audit(req, "sni.delete", req.params["domain"])
+    return json_response({"ok": True, "items": sni.catalog()})
+
+
 @post("/api/nodes")
 def nodes_create(req: Request) -> Response:
     try:
-        node_id = repo.create_node(req.json())
+        node_id = repo.create_node(_node_payload(req.json()))
     except ValueError as exc:
         raise ApiError(400, str(exc)) from exc
     row = _node_or_404(node_id)
@@ -457,10 +527,22 @@ def nodes_show(req: Request) -> Response:
 @patch(r"/api/nodes/(?P<node_id>\d+)")
 def nodes_update(req: Request) -> Response:
     row = _node_or_404(req.params["node_id"])
+    payload = _node_payload(req.json(), fill=False)
+    merged = {key: value for key, value in dict(row).items() if key in repo.NODE_FIELDS}
+    merged.update(payload)
+    # Сменили транспорт/протокол — flow Vision больше не актуален, снимаем его.
+    if "flow" not in payload and str(merged.get("flow") or "") and not nodecfg.supports_vision(
+        str(merged.get("protocol") or ""), str(merged.get("transport") or ""), str(merged.get("security") or "")
+    ):
+        merged["flow"] = ""
+        payload["flow"] = ""
     try:
-        repo.update_node(row["id"], req.json())
+        nodecfg.validate(merged)
+        repo.update_node(row["id"], payload)
     except ValueError as exc:
         raise ApiError(400, str(exc)) from exc
+    if payload.get("sni"):
+        sni.remember(str(payload["sni"]))
     updated = _node_or_404(row["id"])
     _audit(req, "node.update", updated["name"], f"id={row['id']}")
     return json_response(repo.serialize_node(updated, with_secrets=True))

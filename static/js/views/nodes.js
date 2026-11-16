@@ -83,10 +83,40 @@ function field(label, inputHtml, hint = '') {
   return `<div class="field"><label>${label}</label>${inputHtml}${hint ? `<div class="hint">${hint}</div>` : ''}</div>`;
 }
 
-function nodeFormHtml(node) {
+function presetCardHtml(preset, active) {
+  const protocol = (PROTOCOLS.find(([v]) => v === preset.protocol) || [preset.protocol, preset.protocol])[1];
+  const transport = (TRANSPORTS.find(([v]) => v === preset.transport) || [preset.transport, preset.transport])[1];
+  const security = (SECURITIES.find(([v]) => v === preset.security) || [preset.security, preset.security])[1];
+  return `<button type="button" class="preset-card${active ? ' active' : ''}" data-preset="${esc(preset.id)}"
+      title="${esc(preset.hint || '')}">
+    <div class="preset-title">${esc(preset.title)}</div>
+    <div class="preset-meta">${esc(protocol)} · ${esc(transport)} · ${esc(security)}</div>
+    ${preset.badge ? `<span class="preset-badge">${esc(preset.badge)}</span>` : ''}
+  </button>`;
+}
+
+function sniDatalist(items) {
+  return `<datalist id="sni-options">${items.map((item) =>
+    `<option value="${esc(item.domain)}">${esc(item.note || '')}</option>`).join('')}</datalist>`;
+}
+
+function nodeFormHtml(node, meta) {
   const value = (key, fallback = '') => esc(node ? (node[key] ?? fallback) : fallback);
+  const presets = meta.presets || [];
+  const sniItems = meta.sni || [];
+  const activePreset = presets.find((preset) => node
+    && preset.protocol === node.protocol
+    && preset.transport === node.transport
+    && preset.security === node.security) || null;
   return `
     <form id="node-form" autocomplete="off">
+      <div class="preset-block">
+        <div class="preset-head">
+          <span>Автонастройка</span>
+          <span class="hint">Выберите сценарий — панель заполнит протокол, транспорт, порт и SNI.</span>
+        </div>
+        <div class="preset-grid">${presets.map((preset) => presetCardHtml(preset, activePreset && activePreset.id === preset.id)).join('')}</div>
+      </div>
       <div class="form-grid">
         ${field('Название *', `<input class="input" name="name" required value="${value('name')}" placeholder="DF · Frankfurt">`)}
         ${field('Адрес (домен или IP) *', `<input class="input mono" name="address" required value="${value('address')}" placeholder="node.example.com">`)}
@@ -102,8 +132,13 @@ function nodeFormHtml(node) {
 
       <div data-group="tls-like" style="margin-top:14px">
         <div class="form-grid">
-          ${field('SNI / Server Name', `<input class="input mono" name="sni" value="${value('sni')}" placeholder="www.microsoft.com">`,
-            'Домен-маскировка для Reality или имя сертификата для TLS')}
+          ${field('SNI / Server Name', `<div class="input-row">
+              <input class="input mono" name="sni" list="sni-options" value="${value('sni')}" placeholder="www.microsoft.com">
+              <button class="btn btn-sm" type="button" data-act="sni-pick">${icon('globe')}Список</button>
+              <button class="icon-btn" type="button" data-act="sni-random" title="Подставить случайный SNI">${icon('refresh')}</button>
+            </div>${sniDatalist(sniItems)}`,
+            'Домен-маскировка для Reality или имя сертификата для TLS. Список можно проверить и пополнить.')}
+          <div id="sni-panel" class="sni-panel hidden"></div>
           ${field('Fingerprint (uTLS)', `<input class="input mono" name="fingerprint" value="${value('fingerprint', 'chrome')}" placeholder="chrome">`,
             'chrome, firefox, safari, randomized')}
         </div>
@@ -180,21 +215,275 @@ function syncVisibility(form) {
   show('flow', protocol === 'vless' && transport === 'tcp' && security !== 'none');
 }
 
-export function openNodeForm(node = null, onSaved = null) {
+/* ------------------------------------------------- автонастройка и SNI --- */
+
+let nodeMeta = null;
+
+async function loadNodeMeta() {
+  if (nodeMeta) return nodeMeta;
+  try {
+    nodeMeta = await api('/api/nodes/meta');
+  } catch (err) {
+    nodeMeta = { presets: [], sni: [], default_sni: 'www.microsoft.com' };
+  }
+  return nodeMeta;
+}
+
+function markPreset(form, presetId) {
+  form.querySelectorAll('[data-preset]').forEach((card) => {
+    card.classList.toggle('active', card.dataset.preset === presetId);
+  });
+}
+
+function applyPreset(form, preset, meta) {
+  const set = (name, value) => {
+    if (value === undefined || value === null) return;
+    const el = formField(form, name);
+    if (el) el.value = value;
+  };
+  set('protocol', preset.protocol);
+  set('transport', preset.transport);
+  set('security', preset.security);
+  set('port', preset.port || 443);
+  set('flow', preset.flow || '');
+  set('path', preset.path || '');
+  set('service_name', preset.service_name || '');
+  set('alpn', preset.alpn || '');
+
+  const address = formValue(form, 'address').trim();
+  const candidates = (meta.sni || []).map((item) => item.domain);
+  let sniValue = preset.sni || '';
+  if (!sniValue && preset.security === 'tls') {
+    sniValue = /^[a-z0-9.-]+\.[a-z]{2,}$/i.test(address) ? address : '';
+  }
+  if (!sniValue) {
+    const used = address ? [address.toLowerCase()] : [];
+    sniValue = candidates.find((item) => !used.includes(String(item).toLowerCase()))
+      || meta.default_sni
+      || 'www.microsoft.com';
+  }
+  set('sni', sniValue);
+  if (preset.security === 'reality') set('dest', `${sniValue}:${preset.port || 443}`);
+  if (preset.security !== 'reality' && !preset.path) set('path', '');
+  syncVisibility(form);
+  markPreset(form, preset.id);
+  const active = form.querySelector('.preset-card.active');
+  if (active) active.title = preset.hint || '';
+}
+
+function randomSni(meta, address = '') {
+  const items = meta.sni || [];
+  const used = new Set([address.toLowerCase()]);
+  const fresh = items.filter((item) => !used.has(String(item.domain).toLowerCase()));
+  if (!fresh.length) return meta.default_sni || 'www.microsoft.com';
+  const pool = fresh.filter((item) => item.source === 'builtin');
+  const list = pool.length ? pool : fresh;
+  return list[Math.floor(Math.random() * list.length)].domain;
+}
+
+const SNI_SOURCE_LABELS = {
+  builtin: ['встроенный', 'chip'],
+  custom: ['свой', 'chip accent'],
+  recent: ['из ноды', 'chip mint'],
+};
+
+function sniRowsHtml(items, current = '') {
+  return items.map((item, index) => {
+    const [label, cls] = SNI_SOURCE_LABELS[item.source] || [item.source, 'chip'];
+    const active = current && current.toLowerCase() === String(item.domain).toLowerCase();
+    const check = item.check || {};
+    const status = check.status
+      ? (check.status === 'ok' ? ['Подходит', 'mint'] : check.status === 'weak' ? ['Сомнительно', 'warn'] : ['Недоступен', 'offline'])
+      : null;
+    return `<tr data-index="${index}" data-domain="${esc(item.domain)}" class="${active ? 'active' : ''}">
+      <td><div class="cell-main mono">${esc(item.domain)}</div>
+        <div class="cell-sub">${esc(item.note || '')}</div></td>
+      <td><span class="${cls}">${esc(label)}</span></td>
+      <td>${check.tls ? esc(check.tls) : '—'}</td>
+      <td>${check.alpn ? esc(check.alpn) : '—'}</td>
+      <td>${check.latency_ms ? `${esc(check.latency_ms)} мс` : '—'}</td>
+      <td>${status
+        ? `<span class="status ${status[1]}" title="${esc(check.reason || '')}"><span class="dot"></span>${esc(status[0])}</span>`
+        : '<span class="muted">не проверялся</span>'}</td>
+      <td class="num">
+        <button class="btn btn-sm" type="button" data-act="pick-sni" data-domain="${esc(item.domain)}">Выбрать</button>
+        ${item.source === 'custom' ? `<button class="icon-btn" type="button" data-act="drop-sni" data-domain="${esc(item.domain)}" title="Удалить из списка">${icon('trash')}</button>` : ''}
+      </td>
+    </tr>`;
+  }).join('');
+}
+
+export function mountSniPanel(panel, { onPick, current = '' } = {}) {
+  let items = [];
+  let results = {};
+
+  const visibleItems = () => {
+    const query = (panel.querySelector('#sni-search')?.value || '').trim().toLowerCase();
+    return items.filter((item) => !query
+      || item.domain.toLowerCase().includes(query)
+      || String(item.note || '').toLowerCase().includes(query));
+  };
+
+  const paint = () => {
+    const rows = visibleItems();
+    panel.querySelector('#sni-body').innerHTML = sniRowsHtml(rows.map((item) => ({
+      ...item,
+      check: results[item.domain],
+    })), current);
+    panel.querySelector('#sni-count').textContent = `${rows.length} из ${items.length}`;
+  };
+
+  const render = () => {
+    panel.innerHTML = `
+      <div class="sni-bar">
+        <div class="search-field">${icon('search')}
+          <input class="input" id="sni-search" placeholder="Поиск по домену или описанию" autocomplete="off">
+        </div>
+        <div class="spacer"></div>
+        <span class="chip chip-quiet" id="sni-count"></span>
+        <button class="icon-btn" type="button" data-act="sni-close" title="Свернуть">${icon('x')}</button>
+      </div>
+      <div class="sni-add">
+        <input class="input mono" id="sni-new" placeholder="свой домен, например cdn.example.com">
+        <button class="btn btn-sm" type="button" data-act="add">${icon('plus')}Добавить</button>
+        <button class="btn btn-sm" type="button" data-act="scan">${icon('radar')}Проверить</button>
+      </div>
+      ${current ? `<div class="hint" style="margin:8px 0 0">Сейчас в ноде: <code class="mono">${esc(current)}</code></div>` : ''}
+      <div class="table-wrap" style="margin-top:10px;max-height:280px;overflow:auto">
+        <table class="table">
+          <thead><tr><th>Домен</th><th>Источник</th><th>TLS</th><th>ALPN</th><th>Задержка</th><th>Статус</th><th></th></tr></thead>
+          <tbody id="sni-body"></tbody>
+        </table>
+      </div>`;
+    paint();
+    panel.querySelector('#sni-search').addEventListener('input', paint);
+    panel.querySelector('#sni-search').focus();
+  };
+
+  const addSni = async () => {
+    const input = panel.querySelector('#sni-new');
+    const domain = input.value.trim();
+    if (!domain) return;
+    try {
+      const result = await api('/api/sni', { method: 'POST', body: { domain } });
+      items = result.items;
+      nodeMeta = null;
+      input.value = '';
+      paint();
+      toast(result.added ? `SNI ${domain} добавлен` : 'Домен уже есть в списке');
+    } catch (err) { toast(err.message, 'err'); }
+  };
+
+  const scan = async (btn) => {
+    btn.disabled = true;
+    const label = btn.innerHTML;
+    btn.innerHTML = `${icon('refresh')}Проверяю…`;
+    try {
+      const job = await api('/api/reality/scan', {
+        method: 'POST',
+        body: { targets: items.map((item) => item.domain).join('\n'), port: 443, timeout: 4 },
+      });
+      const deadline = Date.now() + 45000;
+      while (Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 800));
+        const status = await api(`/api/reality/scan/${job.job_id}`);
+        results = {};
+        (status.results || []).forEach((row) => { results[row.host] = row; });
+        paint();
+        if (!status.running) break;
+      }
+      const ok = Object.values(results).filter((row) => row.status === 'ok').length;
+      toast(`Проверено доменов: ${Object.keys(results).length}, подходит: ${ok}`);
+    } catch (err) {
+      toast(err.message, 'err');
+    } finally {
+      btn.disabled = false;
+      btn.innerHTML = label;
+    }
+  };
+
+  panel.addEventListener('click', async (ev) => {
+    const el = ev.target.closest('[data-act]');
+    if (!el) return;
+    const act = el.dataset.act;
+    try {
+      if (act === 'sni-close') { panel.classList.add('hidden'); panel.innerHTML = ''; return; }
+      if (act === 'add') { await addSni(); return; }
+      if (act === 'scan') { await scan(el); return; }
+      if (act === 'pick-sni') {
+        if (onPick) onPick(el.dataset.domain);
+        panel.querySelectorAll('#sni-body tr').forEach((row) => {
+          row.classList.toggle('active', row.dataset.domain === el.dataset.domain);
+        });
+        return;
+      }
+      if (act === 'drop-sni') {
+        const result = await api(`/api/sni/${encodeURIComponent(el.dataset.domain)}`, { method: 'DELETE' });
+        items = result.items;
+        nodeMeta = null;
+        paint();
+        toast('SNI удалён');
+      }
+    } catch (err) { toast(err.message, 'err'); }
+  });
+
+  render();
+  api('/api/sni')
+    .then((data) => {
+      items = data.items;
+      if (panel.querySelector('#sni-body')) paint();
+      else render();
+    })
+    .catch((err) => toast(err.message, 'err'));
+}
+
+export async function openNodeForm(node = null, onSaved = null) {
   const isEdit = Boolean(node);
+  const meta = await loadNodeMeta();
   const modal = openModal({
     title: isEdit ? `Сервер · ${node.name}` : 'Новый сервер',
     wide: true,
-    body: nodeFormHtml(node),
+    body: nodeFormHtml(node, meta),
     footer: `
       <button class="btn" data-act="cancel">Отмена</button>
       <button class="btn btn-primary" data-act="save">${isEdit ? 'Сохранить' : 'Создать сервер'}</button>`,
     onMount(root) {
       const form = root.querySelector('#node-form');
       syncVisibility(form);
-      formField(form, 'transport').addEventListener('change', () => syncVisibility(form));
-      formField(form, 'security').addEventListener('change', () => syncVisibility(form));
-      formField(form, 'protocol').addEventListener('change', () => syncVisibility(form));
+      formField(form, 'transport').addEventListener('change', () => { markPreset(form, ''); syncVisibility(form); });
+      formField(form, 'security').addEventListener('change', () => { markPreset(form, ''); syncVisibility(form); });
+      formField(form, 'protocol').addEventListener('change', () => { markPreset(form, ''); syncVisibility(form); });
+      form.querySelectorAll('[data-preset]').forEach((card) => {
+        card.addEventListener('click', () => {
+          const preset = (meta.presets || []).find((item) => item.id === card.dataset.preset);
+          if (!preset) return;
+          applyPreset(form, preset, meta);
+          toast(`Пресет: ${preset.title}`);
+        });
+      });
+      const sniPanel = root.querySelector('#sni-panel');
+      const pickSdomain = (domain) => {
+        formField(form, 'sni').value = domain;
+        if (formValue(form, 'security') === 'reality') {
+          formField(form, 'dest').value = `${domain}:${formValue(form, 'port', '443') || 443}`;
+        }
+        toast(`SNI: ${domain}`);
+      };
+      const pickSni = () => {
+        sniPanel.classList.toggle('hidden');
+        if (!sniPanel.classList.contains('hidden') && !sniPanel.innerHTML.trim()) {
+          mountSniPanel(sniPanel, { current: formValue(form, 'sni'), onPick: pickSdomain });
+        }
+      };
+      form.querySelector('[data-act="sni-pick"]').addEventListener('click', pickSni);
+      form.querySelector('[data-act="sni-random"]').addEventListener('click', () => {
+        const domain = randomSni(meta, formValue(form, 'address').trim());
+        formField(form, 'sni').value = domain;
+        if (formValue(form, 'security') === 'reality') {
+          formField(form, 'dest').value = `${domain}:${formValue(form, 'port', '443') || 443}`;
+        }
+        toast(`SNI: ${domain}`);
+      });
       form.querySelector('[name="name"]').focus();
     },
   });

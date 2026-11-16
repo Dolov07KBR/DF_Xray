@@ -1010,3 +1010,47 @@ tr:hover .row-actions { opacity: 1; }
 }
 .event-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 8px 18px; margin-top: 6px; }
 #token-list .table td { vertical-align: middle; }
+
+/* --- автонастройка ноды и выбор SNI --- */
+.preset-block {
+  border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px;
+  background: rgba(124, 92, 255, .04); margin-bottom: 16px;
+}
+.preset-head { display: block; margin-bottom: 12px; }
+.preset-head > span:first-child { display: block; font-size: 14px; font-weight: 700; color: var(--text); margin-bottom: 2px; }
+.preset-head .hint { margin: 0; line-height: 1.5; }
+.preset-grid {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(158px, 1fr)); gap: 8px;
+}
+.preset-card {
+  position: relative; text-align: left; cursor: pointer; font: inherit;
+  border: 1px solid var(--line); border-radius: 10px; padding: 9px 11px;
+  background: var(--panel-2); color: var(--text); transition: border-color .15s, transform .15s, background .15s;
+}
+.preset-card:hover { border-color: var(--line-strong); transform: translateY(-1px); }
+.preset-card.active {
+  border-color: var(--accent); background: rgba(124, 92, 255, .12);
+  box-shadow: 0 0 0 1px rgba(124, 92, 255, .35) inset;
+}
+.preset-title { font-size: 12.5px; font-weight: 600; margin-bottom: 3px; }
+.preset-meta { font-size: 11px; color: var(--muted); }
+.preset-badge {
+  position: absolute; top: -8px; right: 8px; font-size: 9.5px; letter-spacing: .04em;
+  text-transform: uppercase; padding: 2px 6px; border-radius: 6px;
+  background: var(--accent); color: #fff;
+}
+.input-row { display: flex; gap: 8px; align-items: center; }
+.input-row .input { flex: 1; min-width: 0; }
+.sni-bar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.sni-bar .search-field { flex: 1 1 240px; }
+.sni-add { display: flex; gap: 8px; align-items: center; margin-top: 10px; }
+.sni-panel {
+  grid-column: 1 / -1; margin-top: 4px; padding: 12px; border: 1px solid var(--line-strong); border-radius: 12px;
+  background: var(--panel-2);
+}
+.sni-panel.hidden { display: none; }
+.sni-panel .table th { font-size: 11px; text-transform: uppercase; letter-spacing: .05em; }
+.sni-panel .table td { vertical-align: middle; }
+.sni-add .input { flex: 1; }
+.sni-panel .table tr.active td { background: rgba(124, 92, 255, .1); }
+.sni-panel .table tr.active .cell-main { color: var(--accent); }
