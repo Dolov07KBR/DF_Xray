@@ -8,6 +8,14 @@ import * as subsView from './views/subs.js';
 import * as nodesView from './views/nodes.js';
 import * as auditView from './views/audit.js';
 import * as settingsView from './views/settings.js';
+import * as inboundsView from './views/inbounds.js';
+import * as groupsView from './views/groups.js';
+import * as hostsView from './views/hosts.js';
+import * as outboundsView from './views/outbounds.js';
+import * as routingView from './views/routing.js';
+import * as xrayView from './views/xray.js';
+import * as apiDocsView from './views/api-docs.js';
+import { openPalette } from './palette.js';
 
 const routes = {
   '#/dashboard': {
@@ -18,7 +26,7 @@ const routes = {
     nav: false,
   },
   '#/users': {
-    title: 'Пользователи',
+    title: 'Клиенты',
     subtitle: 'Доступы, лимиты, сроки и конфигурации',
     view: usersView,
     icon: 'users',
@@ -45,23 +53,75 @@ const routes = {
     icon: 'activity',
     nav: true,
   },
+  '#/inbounds': {
+    title: 'Входящие',
+    subtitle: 'Протоколы, транспорт и маскировка Reality',
+    view: inboundsView,
+    icon: 'inbox',
+    nav: false,
+  },
+  '#/groups': {
+    title: 'Группы',
+    subtitle: 'Объединения клиентов для фильтров и массовых действий',
+    view: groupsView,
+    icon: 'layers',
+    nav: false,
+  },
+  '#/hosts': {
+    title: 'Хосты',
+    subtitle: 'Домены-маски из входящих и их проверка',
+    view: hostsView,
+    icon: 'globe',
+    nav: false,
+  },
+  '#/outbounds': {
+    title: 'Исходящие',
+    subtitle: 'Маршруты наружу, попадающие в конфиг Xray',
+    view: outboundsView,
+    icon: 'upload',
+    nav: false,
+  },
+  '#/routing': {
+    title: 'Маршрутизация',
+    subtitle: 'Правила Xray, DNS и выбор основного исходящего',
+    view: routingView,
+    icon: 'route',
+    nav: false,
+  },
+  '#/xray': {
+    title: 'Конфигурации Xray',
+    subtitle: 'Готовый конфиг ноды и Reality-ключи',
+    view: xrayView,
+    icon: 'terminal',
+    nav: false,
+  },
+  '#/api-docs': {
+    title: 'Документация API',
+    subtitle: 'Эндпоинты панели и агентов нод',
+    view: apiDocsView,
+    icon: 'book',
+    nav: false,
+  },
   '#/settings': {
     title: 'Настройки',
-    subtitle: 'Панель, подписки, маршрутизация и безопасность',
+    subtitle: 'Общие параметры, подписки, безопасность и обновления',
     view: settingsView,
     icon: 'settings',
     nav: true,
   },
 };
 
-const NAV_ITEMS = [
-  ['#/dashboard', 'Дашборд', 'grid'],
-  ['#/users', 'Пользователи', 'users'],
-  ['#/subscriptions', 'Подписки', 'link'],
-  ['#/nodes', 'Ноды', 'server'],
-  ['#/audit', 'Журнал', 'activity'],
-  ['#/settings', 'Настройки', 'settings'],
+const NAV = [
+  { href: '#/dashboard', label: 'Дашборд', icon: 'grid' },
+  { href: '#/users', label: 'Клиенты', icon: 'users', badge: 'users' },
+  { href: '#/nodes', label: 'Узлы', icon: 'server' },
+  { href: '#/subscriptions', label: 'Подписки', icon: 'link' },
+  { href: '#/settings', label: 'Настройки', icon: 'settings', badge: 'update' },
 ];
+
+function navKey(href) {
+  return (href || '').split('?')[0];
+}
 
 const root = document.getElementById('app');
 let shell = null;
@@ -84,12 +144,54 @@ function brandHtml() {
     <div class="brand-name">${esc(title)}<small>${esc(subtitle)}</small></div>`;
 }
 
+function navBadge(kind) {
+  if (kind === 'users') return '<span class="nav-badge" id="nav-users-count">—</span>';
+  if (kind === 'update') return '<span class="nav-dot" id="nav-update-dot" hidden></span>';
+  return '';
+}
+
+const GROUP_KEY = 'dfx_nav_groups';
+
+function groupState() {
+  try {
+    return JSON.parse(localStorage.getItem(GROUP_KEY) || '{}') || {};
+  } catch (err) {
+    return {};
+  }
+}
+
+function isGroupOpen(id) {
+  const saved = groupState();
+  return saved[id] === undefined ? true : Boolean(saved[id]);
+}
+
+function toggleGroup(id) {
+  const saved = groupState();
+  saved[id] = !isGroupOpen(id);
+  try { localStorage.setItem(GROUP_KEY, JSON.stringify(saved)); } catch (err) { /* приватный режим */ }
+}
+
 function navHtml() {
-  return NAV_ITEMS.map(([href, label, iconName]) => `
-    <button class="nav-item" data-nav="${href}">
-      ${icon(iconName)}<span>${label}</span>
-      ${href === '#/users' ? '<span class="nav-badge" id="nav-users-count">—</span>' : ''}
-    </button>`).join('');
+  return NAV.map((item) => {
+    if (item.items) {
+      return `
+        <div class="nav-group ${isGroupOpen(item.id) ? 'open' : ''}" data-group="${item.id}">
+          <button class="nav-item nav-parent" data-toggle="${item.id}">
+            ${icon(item.icon)}<span>${item.label}</span>
+            ${navBadge(item.badge)}
+            <span class="nav-caret">${icon('chevron')}</span>
+          </button>
+          <div class="nav-sub">
+            ${item.items.map(([href, label]) => `
+              <button class="nav-subitem" data-nav="${href}">${label}</button>`).join('')}
+          </div>
+        </div>`;
+    }
+    return `
+      <button class="nav-item" data-nav="${item.href}">
+        ${icon(item.icon)}<span>${item.label}</span>${navBadge(item.badge)}
+      </button>`;
+  }).join('');
 }
 
 function shellHtml() {
@@ -98,9 +200,15 @@ function shellHtml() {
       <div class="drawer-backdrop" id="nav-backdrop" style="z-index:35"></div>
       <aside class="sidebar" id="sidebar">
         <div class="brand" id="brand">${brandHtml()}</div>
-        <div class="nav-label">Управление</div>
-        <nav class="nav">${navHtml()}</nav>
+        <button class="nav-search" id="nav-search" type="button">
+          ${icon('search')}<span>Поиск…</span><kbd>Ctrl K</kbd>
+        </button>
+        <div class="nav-label">Навигация</div>
+        <nav class="nav" id="nav">${navHtml()}</nav>
         <div class="sidebar-foot">
+          <button class="update-pill" id="update-pill" type="button" hidden>
+            ${icon('refresh')}<span id="update-pill-text">Доступно обновление</span>
+          </button>
           <div class="node-mini" id="node-mini">
             <div class="row"><span class="muted">Ноды</span><b>—</b></div>
           </div>
@@ -138,9 +246,33 @@ function setActions(html) {
   return fresh;
 }
 
+function hashParams(hash) {
+  return new URLSearchParams((hash || '').split('?')[1] || '');
+}
+
 function setActiveNav(hash) {
+  const base = navKey(hash);
   document.querySelectorAll('[data-nav]').forEach((el) => {
-    el.classList.toggle('active', el.dataset.nav === hash);
+    const key = navKey(el.dataset.nav);
+    let active = key === base && el.dataset.nav === hash;
+    if (key === base && key === '#/settings' && el.dataset.nav.includes('section=')) {
+      const current = hashParams(hash).get('section') || 'general';
+      active = hashParams(el.dataset.nav).get('section') === current;
+    }
+    if (key === base && key === '#/xray' && el.dataset.nav.includes('tab=')) {
+      const current = hashParams(hash).get('tab') || 'config';
+      active = hashParams(el.dataset.nav).get('tab') === current;
+    }
+    el.classList.toggle('active', active);
+    if (active) {
+      const group = el.closest('.nav-group');
+      if (group) group.classList.add('open');
+    }
+  });
+  document.querySelectorAll('.nav-group').forEach((group) => {
+    const hasActive = Boolean(group.querySelector('.nav-subitem.active'));
+    group.classList.toggle('child-active', hasActive);
+    if (hasActive) group.classList.add('open');
   });
 }
 
@@ -184,7 +316,7 @@ async function renderRoute() {
   currentRoute = hash;
   const route = routes[hash];
   if (!contentEl) return;
-  setActiveNav(hash);
+  setActiveNav(window.location.hash || hash);
   document.getElementById('page-title').textContent = route.title;
   document.getElementById('page-sub').textContent = route.subtitle;
   closeMobileNav();
@@ -213,12 +345,28 @@ function bindShell() {
   const backdrop = document.getElementById('nav-backdrop');
 
   sidebar.addEventListener('click', (ev) => {
+    const toggle = ev.target.closest('[data-toggle]');
+    if (toggle) {
+      const id = toggle.dataset.toggle;
+      const group = toggle.closest('.nav-group');
+      toggleGroup(id);
+      if (group) group.classList.toggle('open');
+      return;
+    }
     const navItem = ev.target.closest('[data-nav]');
     if (navItem) {
       navigate(navItem.dataset.nav);
       closeMobileNav();
     }
   });
+
+  const searchBtn = document.getElementById('nav-search');
+  if (searchBtn) searchBtn.addEventListener('click', () => openPalette({ navigate }));
+
+  const updatePill = document.getElementById('update-pill');
+  if (updatePill) {
+    updatePill.addEventListener('click', () => navigate('#/settings?section=update'));
+  }
 
   document.getElementById('menu-toggle').addEventListener('click', () => {
     sidebar.classList.add('open');
@@ -297,6 +445,7 @@ async function boot() {
   }
   await renderRoute();
   booted = true;
+  refreshUpdateBadge();
 
   if (state.bootstrapPassword) {
     toast('Смените пароль администратора по умолчанию', 'err', 6000);
@@ -306,6 +455,29 @@ async function boot() {
 window.addEventListener('hashchange', () => {
   if (booted) renderRoute();
 });
+
+document.addEventListener('keydown', (ev) => {
+  if ((ev.ctrlKey || ev.metaKey) && String(ev.key).toLowerCase() === 'k') {
+    ev.preventDefault();
+    if (booted) openPalette({ navigate });
+  }
+});
+
+async function refreshUpdateBadge() {
+  try {
+    const data = await api('/api/updates');
+    state.update = data;
+  } catch (err) {
+    return;
+  }
+  const pill = document.getElementById('update-pill');
+  const text = document.getElementById('update-pill-text');
+  const dot = document.getElementById('nav-update-dot');
+  const available = Boolean(state.update && state.update.update_available);
+  if (pill) pill.hidden = !available;
+  if (text) text.textContent = available ? `Обновление ${state.update.latest}` : 'Доступно обновление';
+  if (dot) dot.hidden = !available;
+}
 
 window.addEventListener('dfx:unauthorized', () => {
   if (booted) {

@@ -5,7 +5,7 @@ from __future__ import annotations
 import datetime as dt
 import random
 
-from . import db, repo, xray
+from . import config, db, repo, xray
 from .utils import b64url, iso, new_short_id, now, to_int, today_str
 
 DEMO_USERS = [
@@ -44,12 +44,16 @@ def run(demo: bool = True, force: bool = False) -> None:
         return
 
     random.seed(7)
+
+    def _config_revision(node_id: int) -> str:
+        return f"demo{node_id}"
     private_key, public_key = _fake_keys()
 
     nodes = [
         {
             "name": "DF · Frankfurt",
             "address": "de1.df-xray.net",
+            "region": "Германия",
             "port": 443,
             "protocol": "vless",
             "transport": "tcp",
@@ -67,6 +71,7 @@ def run(demo: bool = True, force: bool = False) -> None:
         {
             "name": "DF · Amsterdam CDN",
             "address": "nl1.df-xray.net",
+            "region": "Нидерланды",
             "port": 443,
             "protocol": "vless",
             "transport": "ws",
@@ -82,6 +87,7 @@ def run(demo: bool = True, force: bool = False) -> None:
         {
             "name": "DF · Moscow",
             "address": "ru1.df-xray.net",
+            "region": "Россия",
             "port": 8443,
             "protocol": "vmess",
             "transport": "ws",
@@ -100,10 +106,64 @@ def run(demo: bool = True, force: bool = False) -> None:
         node_id = repo.create_node(item)
         node_ids.append(node_id)
         repo.touch_node(node_id, "Xray 25.9.11")
-        db.run(
-            "UPDATE nodes SET last_seen = ? WHERE id = ?",
-            (iso(now() - dt.timedelta(seconds=25 + 20 * node_id)), node_id),
+        repo.update_node_metrics(
+            node_id,
+            {
+                "xray_version": "Xray 25.9.11",
+                "agent_version": config.APP_VERSION,
+                "xray_running": True,
+                "uptime": 86400 * (3 + node_id) + 3600 * node_id,
+                "load1": round(0.12 * node_id, 2),
+                "memory": {"used": 180 * 1024 * 1024 * node_id, "total": 2 * 1024 * 1024 * 1024},
+                "revision": f"demo{node_id}",
+                "last_error": "",
+            },
         )
+        db.run(
+            "UPDATE nodes SET last_seen = ?, cfg_revision = ? WHERE id = ?",
+            (
+                iso(now() - dt.timedelta(seconds=25 + 20 * node_id)),
+                _config_revision(node_id),
+                node_id,
+            ),
+        )
+
+    groups = ["Семья", "Работа", "Тесты"]
+    colors = ["#7c5cff", "#3fb950", "#4f8cff"]
+    group_ids: list[int] = []
+    for index, group_name in enumerate(groups):
+        try:
+            group_ids.append(
+                repo.create_group({"name": group_name, "color": colors[index % len(colors)]})
+            )
+        except ValueError:
+            row = db.one("SELECT id FROM groups WHERE name = ?", (group_name,))
+            if row:
+                group_ids.append(int(row["id"]))
+
+    outbounds = [
+        {
+            "name": "Германия SOCKS",
+            "tag": "de-socks",
+            "type": "socks",
+            "address": "10.8.0.2",
+            "port": 1080,
+            "username": "dfx",
+            "password": "demo-pass",
+            "sort": 20,
+        },
+        {
+            "name": "Резервный HTTP",
+            "tag": "backup-http",
+            "type": "http",
+            "address": "10.8.0.3",
+            "port": 3128,
+            "sort": 40,
+        },
+    ]
+    if db.scalar("SELECT COUNT(*) FROM outbounds") == 0:
+        for outbound in outbounds:
+            repo.create_outbound(outbound)
 
     for idx, (username, email, limit_gb, days, devices, state) in enumerate(DEMO_USERS):
         user_id = repo.create_user(
@@ -115,6 +175,7 @@ def run(demo: bool = True, force: bool = False) -> None:
                 "device_limit": devices,
                 "note": "демо-пользователь",
                 "flow": "xtls-rprx-vision" if idx % 2 == 0 else "",
+                "group_id": group_ids[idx % len(group_ids)] if group_ids else 0,
             }
         )
         enabled = state not in ("disabled",)

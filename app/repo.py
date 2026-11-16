@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
 import sqlite3
+import time
 from typing import Any
 
 from . import config, db
@@ -40,6 +42,7 @@ USER_FIELDS = (
 NODE_FIELDS = (
     "name",
     "address",
+    "region",
     "port",
     "protocol",
     "cert_file",
@@ -57,11 +60,13 @@ NODE_FIELDS = (
     "flow",
     "alpn",
     "enabled",
+    "drain",
     "note",
     "sort",
 )
 
-TRANSPORTS = ("tcp", "ws", "grpc", "xhttp", "h2")
+#: Актуальные транспорты Xray: HTTP/2 удалён из ядра, вместо него httpupgrade.
+TRANSPORTS = ("tcp", "ws", "grpc", "xhttp", "httpupgrade")
 SECURITIES = ("reality", "tls", "none")
 PROTOCOLS = ("vless", "vmess", "trojan")
 
@@ -113,6 +118,9 @@ def serialize_user(
         "days_left": days_between(expires_at) if expires_at else None,
         "device_limit": to_int(data.get("device_limit")),
         "node_ids": node_ids,
+        "group_id": to_int(data.get("group_id")) or None,
+        "group_name": data.get("group_name") or "",
+        "group_color": data.get("group_color") or "",
         "status": user_status(data),
         "last_online_at": data.get("last_online_at") or "",
         "last_sub_at": data.get("last_sub_at") or "",
@@ -131,19 +139,26 @@ def list_users(
     limit: int = 200,
     offset: int = 0,
     base_url: str = "",
+    group_id: int = 0,
 ) -> tuple[list[dict[str, Any]], int]:
     where: list[str] = []
     params: list[Any] = []
+    if group_id:
+        where.append("u.group_id = ?")
+        params.append(group_id)
     if q:
         where.append(
-            "(lower(username) LIKE ? OR lower(coalesce(email,'')) LIKE ? "
-            "OR lower(coalesce(note,'')) LIKE ? OR uuid LIKE ?)"
+            "(lower(u.username) LIKE ? OR lower(coalesce(u.email,'')) LIKE ? "
+            "OR lower(coalesce(u.note,'')) LIKE ? OR u.uuid LIKE ?)"
         )
         pattern = f"%{q.strip().lower()}%"
         params += [pattern, pattern, pattern, f"%{q.strip()}%"]
     clause = f"WHERE {' AND '.join(where)}" if where else ""
     rows = db.all(
-        f"SELECT * FROM users {clause} ORDER BY id DESC", params
+        "SELECT u.*, g.name AS group_name, g.color AS group_color "
+        f"FROM users u LEFT JOIN groups g ON g.id = u.group_id {clause} "
+        "ORDER BY u.id DESC",
+        params,
     )
     items = [serialize_user(r, base_url) for r in rows]
     if status and status != "all":
@@ -166,7 +181,11 @@ def list_users(
 
 
 def get_user(user_id: int) -> sqlite3.Row | None:
-    return db.one("SELECT * FROM users WHERE id = ?", (user_id,))
+    return db.one(
+        "SELECT u.*, g.name AS group_name, g.color AS group_color "
+        "FROM users u LEFT JOIN groups g ON g.id = u.group_id WHERE u.id = ?",
+        (user_id,),
+    )
 
 
 def get_user_by_token(sub_token: str) -> sqlite3.Row | None:
@@ -201,11 +220,13 @@ def create_user(payload: dict[str, Any]) -> int:
     node_ids_text = ",".join(str(to_int(x)) for x in node_ids if to_int(x)) or None
     limit_bytes = gb_to_bytes(payload.get("limit_gb", 0))
     stamp = iso()
+    group_id = to_int(payload.get("group_id", 0)) or None
     return db.run(
         """INSERT INTO users(
             username, email, uuid, sub_token, flow, limit_bytes,
-            expires_at, enabled, note, device_limit, node_ids, created_at, updated_at
-        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            expires_at, enabled, note, device_limit, node_ids, group_id,
+            created_at, updated_at
+        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             username,
             (payload.get("email") or "").strip() or None,
@@ -218,6 +239,7 @@ def create_user(payload: dict[str, Any]) -> int:
             (payload.get("note") or "").strip() or None,
             to_int(payload.get("device_limit", 0)),
             node_ids_text,
+            group_id,
             stamp,
             stamp,
         ),
@@ -255,6 +277,8 @@ def update_user(user_id: int, payload: dict[str, Any]) -> None:
     if "days" in payload and payload["days"] not in (None, ""):
         days_int = to_int(payload["days"])
         fields["expires_at"] = today_str(days_int) if days_int > 0 else None
+    if "group_id" in payload:
+        fields["group_id"] = to_int(payload["group_id"]) or None
     if "enabled" in payload:
         fields["enabled"] = 1 if to_bool(payload["enabled"]) else 0
     if "node_ids" in payload:
@@ -345,12 +369,26 @@ def node_status(row: sqlite3.Row | dict[str, Any]) -> str:
     return "offline"
 
 
+def node_health(row: sqlite3.Row | dict[str, Any]) -> str:
+    """Здоровье ноды: offline / degraded (Xray не работает) / ok."""
+    data = dict(row)
+    if not to_int(data.get("enabled")):
+        return "disabled"
+    status = node_status(data)
+    if status != "online":
+        return "offline" if status == "offline" else "unknown"
+    if data.get("xray_running") is not None and not to_int(data.get("xray_running")):
+        return "degraded"
+    return "ok"
+
+
 def serialize_node(row: sqlite3.Row | dict[str, Any], with_secrets: bool = False) -> dict[str, Any]:
     data = dict(row)
     node = {
         "id": data["id"],
         "name": data["name"],
         "address": data["address"],
+        "region": data.get("region") or "",
         "port": to_int(data["port"]),
         "protocol": data.get("protocol") or "vless",
         "transport": data.get("transport") or "tcp",
@@ -367,18 +405,42 @@ def serialize_node(row: sqlite3.Row | dict[str, Any], with_secrets: bool = False
         "flow": data.get("flow") or "",
         "alpn": data.get("alpn") or "",
         "enabled": bool(to_int(data.get("enabled"))),
+        "drain": bool(to_int(data.get("drain"))),
+        "drained_at": data.get("drained_at") or "",
         "status": node_status(data),
+        "health": node_health(data),
         "last_seen": data.get("last_seen") or "",
         "xray_version": data.get("xray_version") or "",
         "up_bytes": to_int(data.get("up_bytes")),
         "down_bytes": to_int(data.get("down_bytes")),
         "note": data.get("note") or "",
         "sort": to_int(data.get("sort")),
+        "agent_version": data.get("agent_version") or "",
+        "xray_running": None if data.get("xray_running") is None else bool(to_int(data.get("xray_running"))),
+        "uptime_seconds": to_int(data.get("uptime_seconds")),
+        "load1": float(data.get("load1") or 0),
+        "cpu": float(data.get("cpu") or 0),
+        "mem_used": to_int(data.get("mem_used")),
+        "mem_total": to_int(data.get("mem_total")),
+        "mem_percent": (
+            round(to_int(data.get("mem_used")) * 100 / to_int(data.get("mem_total")), 1)
+            if to_int(data.get("mem_total"))
+            else 0.0
+        ),
+        "cfg_revision": data.get("cfg_revision") or "",
+        "applied_at": data.get("applied_at") or "",
+        "last_error": data.get("last_error") or "",
+        "xray_port": to_int(data.get("xray_port")),
+        "port_mismatch": bool(
+            to_int(data.get("xray_port"))
+            and to_int(data.get("xray_port")) != to_int(data.get("port"))
+        ),
         "created_at": data.get("created_at") or "",
     }
     if with_secrets:
         node["private_key"] = data.get("private_key") or ""
         node["agent_token"] = data.get("agent_token") or ""
+        node["install_token"] = data.get("install_token") or ""
     return node
 
 
@@ -393,6 +455,26 @@ def get_node(node_id: int) -> sqlite3.Row | None:
 
 def get_node_by_token(agent_token: str) -> sqlite3.Row | None:
     return db.one("SELECT * FROM nodes WHERE agent_token = ?", ((agent_token or "").strip(),))
+
+
+def node_install_token(node_id: int, rotate: bool = False) -> str:
+    """Токен для скрипта установки ноды (не равен токену агента)."""
+    row = get_node(node_id)
+    if row is None:
+        raise ValueError("Нода не найдена")
+    existing = (row["install_token"] or "").strip()
+    if existing and not rotate:
+        return existing
+    value = token(24)
+    db.run("UPDATE nodes SET install_token = ? WHERE id = ?", (value, node_id))
+    return value
+
+
+def get_node_by_install_token(install_token: str) -> sqlite3.Row | None:
+    value = (install_token or "").strip()
+    if not value:
+        return None
+    return db.one("SELECT * FROM nodes WHERE install_token = ?", (value,))
 
 
 def create_node(payload: dict[str, Any]) -> int:
@@ -414,13 +496,14 @@ def create_node(payload: dict[str, Any]) -> int:
     stamp = iso()
     node_id = db.run(
         """INSERT INTO nodes(
-            name, address, port, protocol, transport, security, sni, fingerprint,
+            name, address, region, port, protocol, transport, security, sni, fingerprint,
             private_key, public_key, short_id, dest, path, service_name, flow,
             alpn, cert_file, key_file, enabled, note, sort, agent_token, created_at, updated_at
-        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             name,
             address,
+            (payload.get("region") or "").strip() or None,
             to_int(payload.get("port"), 443),
             protocol,
             transport,
@@ -456,8 +539,10 @@ def update_node(node_id: int, payload: dict[str, Any]) -> None:
     for key in NODE_FIELDS:
         if key not in payload:
             continue
-        if key in ("enabled",):
+        if key in ("enabled", "drain"):
             fields[key] = 1 if to_bool(payload[key]) else 0
+            if key == "drain":
+                fields["drained_at"] = iso() if fields[key] else None
         elif key == "port":
             fields[key] = to_int(payload[key], 443)
         elif key in ("sort",):
@@ -486,9 +571,106 @@ def update_node(node_id: int, payload: dict[str, Any]) -> None:
     db.run(f"UPDATE nodes SET {assignments} WHERE id = ?", (*fields.values(), node_id))
 
 
+def traffic_by_node(days: int = 14) -> list[dict[str, Any]]:
+    """Трафик по нодам за период (для дашборда мультисерверной панели)."""
+    rows = db.all(
+        "SELECT node_id, SUM(up + down) AS total FROM traffic WHERE day >= ? GROUP BY node_id",
+        (today_str(-(max(1, days) - 1)),),
+    )
+    totals = {to_int(row["node_id"]): to_int(row["total"]) for row in rows}
+    result = []
+    for node in list_nodes():
+        result.append(
+            {
+                "id": node["id"],
+                "name": node["name"],
+                "status": node["status"],
+                "health": node["health"],
+                "total": totals.get(node["id"], 0),
+                "users_count": len(node_traffic_users(node["id"])),
+            }
+        )
+    result.sort(key=lambda item: item["total"], reverse=True)
+    return result
+
+
+def replace_user_node(from_node_id: int, to_node_id: int) -> int:
+    """Перевести клиентов, закреплённых за нодой, на другую ноду."""
+    moved = 0
+    rows = db.all("SELECT id, node_ids FROM users")
+    for row in rows:
+        raw = (row["node_ids"] or "").strip()
+        if not raw:
+            continue
+        ids = [item.strip() for item in raw.split(",") if item.strip()]
+        if str(from_node_id) not in ids:
+            continue
+        result: list[str] = []
+        for item in ids:
+            value = str(to_node_id) if item == str(from_node_id) else item
+            if value not in result:
+                result.append(value)
+        db.run("UPDATE users SET node_ids = ? WHERE id = ?", (",".join(result), row["id"]))
+        moved += 1
+    return moved
+
+
 def delete_node(node_id: int) -> None:
     db.run("DELETE FROM nodes WHERE id = ?", (node_id,))
     db.run("DELETE FROM traffic WHERE node_id = ?", (node_id,))
+
+
+def update_node_metrics(node_id: int, payload: dict[str, Any]) -> None:
+    """Принять heartbeat агента: версии, состояние Xray, железо, ревизия конфига."""
+    fields: dict[str, Any] = {"last_seen": iso(), "status": "online"}
+
+    version = (payload.get("xray_version") or "").strip()[:40]
+    if version:
+        fields["xray_version"] = version
+    agent_version = (payload.get("agent_version") or "").strip()[:40]
+    if agent_version:
+        fields["agent_version"] = agent_version
+    if "xray_running" in payload:
+        fields["xray_running"] = 1 if to_bool(payload.get("xray_running")) else 0
+    if "uptime" in payload:
+        fields["uptime_seconds"] = to_int(payload.get("uptime"))
+    if "load1" in payload:
+        with contextlib.suppress(TypeError, ValueError):
+            fields["load1"] = max(0.0, float(payload.get("load1") or 0))
+    memory = payload.get("memory") or {}
+    cpu = None
+    if isinstance(memory, dict):
+        if memory.get("used") is not None:
+            fields["mem_used"] = max(0, to_int(memory.get("used")))
+        if memory.get("total") is not None:
+            fields["mem_total"] = max(0, to_int(memory.get("total")))
+    if "cpu" in payload:
+        with contextlib.suppress(TypeError, ValueError):
+            cpu = round(max(0.0, min(100.0, float(payload.get("cpu") or 0))), 1)
+            fields["cpu"] = cpu
+    reported_port = to_int(payload.get("xray_port"))
+    if reported_port:
+        fields["xray_port"] = reported_port
+    revision = (payload.get("revision") or "").strip()[:40]
+    if revision:
+        fields["cfg_revision"] = revision
+        fields["applied_at"] = iso()
+    error = (payload.get("last_error") or "").strip()[:400]
+    if "last_error" in payload:
+        fields["last_error"] = error or None
+
+    assignments = ", ".join(f"{key} = ?" for key in fields)
+    db.run(f"UPDATE nodes SET {assignments} WHERE id = ?", (*fields.values(), node_id))
+
+    # История метрик для графиков на дашборде (панель пишет то же самое для node_id = 0).
+    if cpu is not None or "mem_used" in fields:
+        add_metrics(
+            node_id,
+            cpu if cpu is not None else 0.0,
+            fields.get("mem_used", 0),
+            fields.get("mem_total", 0),
+            fields.get("load1", 0.0),
+        )
 
 
 def touch_node(node_id: int, version: str | None = None) -> None:
@@ -628,7 +810,14 @@ def dashboard(base_url: str = "") -> dict[str, Any]:
     )
     return {
         "counts": counts,
-        "nodes": {"total": len(nodes), "online": nodes_online, "items": nodes},
+        "nodes": {
+            "total": len(nodes),
+            "online": nodes_online,
+            "offline": sum(1 for n in nodes if n["health"] == "offline"),
+            "degraded": sum(1 for n in nodes if n["health"] == "degraded"),
+            "items": nodes,
+            "traffic": traffic_by_node(14),
+        },
         "traffic": {
             "up": totals["up"],
             "down": totals["down"],
@@ -642,3 +831,308 @@ def dashboard(base_url: str = "") -> dict[str, Any]:
         "audit": list_audit(8),
         "version": config.APP_VERSION,
     }
+
+
+# --------------------------------------------------------------------------
+# Группы клиентов
+# --------------------------------------------------------------------------
+
+GROUP_COLORS = (
+    "#7c5cff", "#4f8cff", "#3fb950", "#d29922", "#f85149", "#a371f7", "#2dd4bf",
+)
+
+
+def serialize_group(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+    data = dict(row)
+    used = to_int(data.get("used_bytes"))
+    return {
+        "id": data["id"],
+        "name": data["name"],
+        "color": data.get("color") or GROUP_COLORS[0],
+        "note": data.get("note") or "",
+        "users_count": to_int(data.get("users_count")),
+        "used_bytes": used,
+        "used_human": human_size(used),
+        "created_at": data.get("created_at") or "",
+    }
+
+
+def list_groups() -> list[dict[str, Any]]:
+    rows = db.all(
+        "SELECT g.*, COUNT(u.id) AS users_count, "
+        "COALESCE(SUM(u.up_bytes + u.down_bytes), 0) AS used_bytes "
+        "FROM groups g LEFT JOIN users u ON u.group_id = g.id "
+        "GROUP BY g.id ORDER BY g.name COLLATE NOCASE"
+    )
+    return [serialize_group(row) for row in rows]
+
+
+def get_group(group_id: int) -> sqlite3.Row | None:
+    return db.one("SELECT * FROM groups WHERE id = ?", (group_id,))
+
+
+def create_group(payload: dict[str, Any]) -> int:
+    name = (payload.get("name") or "").strip()
+    if not name:
+        raise ValueError("Укажите название группы")
+    if len(name) > 64:
+        raise ValueError("Название группы слишком длинное")
+    if db.one("SELECT 1 FROM groups WHERE lower(name) = lower(?)", (name,)):
+        raise ValueError("Группа с таким названием уже есть")
+    return db.run(
+        "INSERT INTO groups(name, color, note, created_at) VALUES(?,?,?,?)",
+        (
+            name,
+            (payload.get("color") or "").strip() or GROUP_COLORS[0],
+            (payload.get("note") or "").strip(),
+            iso(),
+        ),
+    )
+
+
+def update_group(group_id: int, payload: dict[str, Any]) -> None:
+    row = get_group(group_id)
+    if row is None:
+        raise ValueError("Группа не найдена")
+    fields: dict[str, Any] = {}
+    if "name" in payload:
+        name = (payload["name"] or "").strip()
+        if not name:
+            raise ValueError("Название группы не может быть пустым")
+        other = db.one(
+            "SELECT id FROM groups WHERE lower(name) = lower(?) AND id != ?",
+            (name, group_id),
+        )
+        if other:
+            raise ValueError("Группа с таким названием уже есть")
+        fields["name"] = name
+    if "color" in payload:
+        fields["color"] = (payload["color"] or "").strip() or GROUP_COLORS[0]
+    if "note" in payload:
+        fields["note"] = (payload["note"] or "").strip()
+    if not fields:
+        return
+    assignments = ", ".join(f"{key} = ?" for key in fields)
+    db.run(f"UPDATE groups SET {assignments} WHERE id = ?", (*fields.values(), group_id))
+
+
+def delete_group(group_id: int) -> None:
+    db.run("DELETE FROM groups WHERE id = ?", (group_id,))
+
+
+# --------------------------------------------------------------------------
+# Исходящие (outbounds)
+# --------------------------------------------------------------------------
+
+OUTBOUND_TYPES = ("direct", "block", "socks", "http", "wireguard", "shadowsocks", "trojan")
+
+
+def _slug_tag(name: str, fallback: str = "outbound") -> str:
+    letters = [ch.lower() if ch.isalnum() else "-" for ch in (name or "")]
+    slug = "".join(letters).strip("-")
+    while "--" in slug:
+        slug = slug.replace("--", "-")
+    return slug[:32] or fallback
+
+
+def serialize_outbound(row: sqlite3.Row | dict[str, Any], with_secrets: bool = False) -> dict[str, Any]:
+    data = dict(row)
+    password = data.get("password") or ""
+    return {
+        "id": data["id"],
+        "name": data["name"],
+        "tag": data.get("tag") or _slug_tag(data["name"]),
+        "type": data.get("type") or "direct",
+        "address": data.get("address") or "",
+        "port": to_int(data.get("port")),
+        "username": data.get("username") or "",
+        "password": password if with_secrets else ("•" * 8 if password else ""),
+        "sni": data.get("sni") or "",
+        "enabled": bool(to_int(data.get("enabled"))),
+        "sort": to_int(data.get("sort")),
+        "created_at": data.get("created_at") or "",
+        "updated_at": data.get("updated_at") or "",
+    }
+
+
+def list_outbounds(with_secrets: bool = False) -> list[dict[str, Any]]:
+    rows = db.all("SELECT * FROM outbounds ORDER BY sort, id")
+    return [serialize_outbound(row, with_secrets) for row in rows]
+
+
+def get_outbound(outbound_id: int) -> sqlite3.Row | None:
+    return db.one("SELECT * FROM outbounds WHERE id = ?", (outbound_id,))
+
+
+def create_outbound(payload: dict[str, Any]) -> int:
+    name = (payload.get("name") or "").strip()
+    if not name:
+        raise ValueError("Укажите название исходящего")
+    kind = (payload.get("type") or "direct").strip().lower()
+    if kind not in OUTBOUND_TYPES:
+        raise ValueError("Неизвестный тип исходящего")
+    stamp = iso()
+    return db.run(
+        "INSERT INTO outbounds(name, tag, type, address, port, username, password, sni, "
+        "enabled, sort, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            name,
+            (payload.get("tag") or "").strip() or _slug_tag(name),
+            kind,
+            (payload.get("address") or "").strip(),
+            to_int(payload.get("port")),
+            (payload.get("username") or "").strip(),
+            (payload.get("password") or "").strip(),
+            (payload.get("sni") or "").strip(),
+            1 if to_bool(payload.get("enabled", True)) else 0,
+            to_int(payload.get("sort", 100)),
+            stamp,
+            stamp,
+        ),
+    )
+
+
+def update_outbound(outbound_id: int, payload: dict[str, Any]) -> None:
+    row = get_outbound(outbound_id)
+    if row is None:
+        raise ValueError("Исходящий не найден")
+    fields: dict[str, Any] = {}
+    if "name" in payload:
+        name = (payload["name"] or "").strip()
+        if not name:
+            raise ValueError("Название не может быть пустым")
+        fields["name"] = name
+    if "tag" in payload:
+        fields["tag"] = (payload["tag"] or "").strip() or _slug_tag(
+            fields.get("name") or dict(row)["name"]
+        )
+    if "type" in payload:
+        kind = (payload["type"] or "").strip().lower()
+        if kind not in OUTBOUND_TYPES:
+            raise ValueError("Неизвестный тип исходящего")
+        fields["type"] = kind
+    for key in ("address", "username", "sni"):
+        if key in payload:
+            fields[key] = (payload[key] or "").strip()
+    if "password" in payload:
+        fields["password"] = (payload["password"] or "").strip()
+    if "port" in payload:
+        fields["port"] = to_int(payload["port"])
+    if "sort" in payload:
+        fields["sort"] = to_int(payload["sort"])
+    if "enabled" in payload:
+        fields["enabled"] = 1 if to_bool(payload["enabled"]) else 0
+    if not fields:
+        return
+    fields["updated_at"] = iso()
+    assignments = ", ".join(f"{key} = ?" for key in fields)
+    db.run(f"UPDATE outbounds SET {assignments} WHERE id = ?", (*fields.values(), outbound_id))
+
+
+def delete_outbound(outbound_id: int) -> None:
+    db.run("DELETE FROM outbounds WHERE id = ?", (outbound_id,))
+
+
+# --------------------------------------------------------------------------
+# Команды агентам нод (перезапуск Xray и проверка конфига)
+# --------------------------------------------------------------------------
+
+NODE_COMMANDS: dict[str, str] = {
+    "restart_xray": "Перезапустить Xray",
+    "test_config": "Проверить конфиг через xray -test",
+    "restart_agent": "Перезапустить агент",
+}
+MAX_PENDING_COMMANDS = 5
+
+
+def create_node_command(node_id: int, command: str, actor: str = "") -> int:
+    if command not in NODE_COMMANDS:
+        raise ValueError("Неизвестная команда для ноды")
+    stamp = iso()
+    command_id = db.run(
+        "INSERT INTO node_commands(node_id, command, status, created_by, created_at) "
+        "VALUES(?, ?, 'pending', ?, ?)",
+        (node_id, command, actor, stamp),
+    )
+    return int(command_id)
+
+
+def node_commands_queue(node_id: int, limit: int = MAX_PENDING_COMMANDS) -> list[dict[str, Any]]:
+    rows = db.all(
+        "SELECT * FROM node_commands WHERE node_id = ? AND status = 'pending' "
+        "ORDER BY id ASC LIMIT ?",
+        (node_id, limit),
+    )
+    items = [dict(row) for row in rows]
+    if items:
+        placeholders = ",".join("?" for _ in items)
+        db.run(
+            f"UPDATE node_commands SET status = 'running' WHERE id IN ({placeholders})",
+            tuple(item["id"] for item in items),
+        )
+    return items
+
+
+COMMAND_OK_STATUSES = {"done", "ok", "success", "completed", "0"}
+
+
+def finish_node_command(command_id: int, status: str, result: str = "") -> None:
+    """Зафиксировать результат команды. Агент присылает done/error, но панель
+    принимает и человеческие варианты (ok/success), чтобы не писать ложную ошибку."""
+    normalized = "done" if str(status).strip().lower() in COMMAND_OK_STATUSES else "error"
+    db.run(
+        "UPDATE node_commands SET status = ?, result = ?, finished_at = ? WHERE id = ?",
+        (normalized, str(result)[:400], iso(), command_id),
+    )
+
+
+def list_node_commands(node_id: int, limit: int = 15) -> list[dict[str, Any]]:
+    rows = db.all(
+        "SELECT * FROM node_commands WHERE node_id = ? ORDER BY id DESC LIMIT ?",
+        (node_id, limit),
+    )
+    items = []
+    for row in rows:
+        item = dict(row)
+        item["title"] = NODE_COMMANDS.get(item["command"], item["command"])
+        items.append(item)
+    return items
+
+
+# --------------------------------------------------------------------------
+# Метрики железа: панель (node_id = 0) и ноды
+# --------------------------------------------------------------------------
+
+PANEL_METRICS_ID = 0
+
+
+def add_metrics(node_id: int, cpu: float, mem_used: int, mem_total: int, load1: float) -> None:
+    db.run(
+        "INSERT INTO metrics(node_id, ts, cpu, mem_used, mem_total, load1) VALUES(?,?,?,?,?,?)",
+        (node_id, int(time.time()), round(float(cpu or 0), 1), max(0, to_int(mem_used)),
+         max(0, to_int(mem_total)), round(float(load1 or 0), 2)),
+    )
+
+
+def metrics_series(node_id: int, minutes: int = 60, limit: int = 720) -> list[dict[str, Any]]:
+    since = int(time.time()) - max(1, minutes) * 60
+    rows = db.all(
+        "SELECT ts, cpu, mem_used, mem_total, load1 FROM metrics "
+        "WHERE node_id = ? AND ts >= ? ORDER BY ts DESC LIMIT ?",
+        (node_id, since, limit),
+    )
+    return [dict(row) for row in reversed(rows)]
+
+
+def prune_metrics(hours: int = 48) -> int:
+    cutoff = int(time.time()) - max(1, hours) * 3600
+    return int(db.run("DELETE FROM metrics WHERE ts < ?", (cutoff,)))
+
+
+def latest_metrics(node_id: int) -> dict[str, Any] | None:
+    row = db.one(
+        "SELECT ts, cpu, mem_used, mem_total, load1 FROM metrics "
+        "WHERE node_id = ? ORDER BY ts DESC, rowid DESC LIMIT 1",
+        (node_id,),
+    )
+    return dict(row) if row else None

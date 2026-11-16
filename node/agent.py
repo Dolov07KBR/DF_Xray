@@ -39,9 +39,17 @@ CONFIG_PATH = os.environ.get("DFX_CONFIG_PATH", "/etc/xray/config.json")
 POLL = int(os.environ.get("DFX_POLL", "30"))
 DRY_RUN = os.environ.get("DFX_DRY_RUN", "0") in ("1", "true", "yes")
 STATS_API = os.environ.get("DFX_STATS_API", "127.0.0.1:10085")
+# Порт, который реально опубликован у контейнера/фаервола. Если панель прислала
+# другую цифру, приводим inbound к этому порту — иначе клиенты бьются в закрытую дверь.
+FORCED_PORT = int(os.environ.get("XRAY_PORT") or os.environ.get("DFX_XRAY_PORT") or "0")
 LOG_LEVEL = os.environ.get("DFX_LOG_LEVEL", "info").lower()
 
 STOP = False
+
+AGENT_VERSION = "1.5.1"
+APPLIED_REVISION = ""
+LAST_ERROR = ""
+APPLIED_PORT = 0
 
 
 def log(message: str, level: str = "info") -> None:
@@ -78,6 +86,77 @@ def report(payload: dict) -> dict:
 
 def heartbeat(payload: dict) -> dict:
     return _request("POST", f"{PANEL_URL}/api/agent/heartbeat", payload)
+
+
+# --------------------------------------------------------------------------
+# Метрики сервера
+# --------------------------------------------------------------------------
+
+
+_last_cpu: tuple[int, int] | None = None
+
+
+def cpu_percent() -> float:
+    """Загрузка CPU в процентах между вызовами (по /proc/stat)."""
+    global _last_cpu
+    try:
+        with open("/proc/stat", encoding="utf-8") as handle:
+            parts = handle.readline().split()
+        values = [int(v) for v in parts[1:] if v.isdigit()]
+        idle = values[3] + (values[4] if len(values) > 4 else 0)
+        total = sum(values)
+    except (OSError, ValueError, IndexError):
+        try:
+            return round(os.getloadavg()[0] * 100 / max(1, os.cpu_count() or 1), 1)
+        except (OSError, AttributeError):
+            return 0.0
+    busy = total - idle
+    if _last_cpu is None:
+        _last_cpu = (busy, total)
+        return 0.0
+    busy_delta = busy - _last_cpu[0]
+    total_delta = total - _last_cpu[1]
+    _last_cpu = (busy, total)
+    if total_delta <= 0:
+        return 0.0
+    return round(max(0.0, min(100.0, busy_delta * 100 / total_delta)), 1)
+
+
+def system_metrics() -> dict:
+    """Данные о сервере для панели: uptime, load average, процессор, память."""
+    metrics = {"agent_version": AGENT_VERSION, "xray_running": False,
+               "uptime": 0, "load1": 0.0, "cpu": 0.0,
+               "cores": os.cpu_count() or 1,
+               "memory": {"used": 0, "total": 0}}
+    try:
+        with open("/proc/uptime", encoding="utf-8") as handle:
+            metrics["uptime"] = int(float(handle.read().split()[0]))
+    except (OSError, ValueError, IndexError):
+        metrics["uptime"] = int(time.time())
+    try:
+        metrics["load1"] = round(os.getloadavg()[0], 2)
+    except (OSError, AttributeError):
+        metrics["load1"] = 0.0
+    metrics["cpu"] = cpu_percent()
+    try:
+        meminfo = {}
+        with open("/proc/meminfo", encoding="utf-8") as handle:
+            for line in handle:
+                key, _, rest = line.partition(":")
+                meminfo[key.strip()] = int(rest.strip().split()[0]) * 1024
+        total = meminfo.get("MemTotal", 0)
+        available = meminfo.get("MemAvailable", meminfo.get("MemFree", 0))
+        metrics["memory"] = {"used": max(0, total - available), "total": total}
+    except (OSError, ValueError, IndexError):
+        pass
+    if DRY_RUN:
+        metrics["xray_running"] = True
+    else:
+        metrics["xray_running"] = xray.is_running()
+    metrics["revision"] = APPLIED_REVISION
+    metrics["last_error"] = LAST_ERROR
+    metrics["xray_port"] = APPLIED_PORT
+    return metrics
 
 
 # --------------------------------------------------------------------------
@@ -269,19 +348,114 @@ def query_stats() -> dict[str, dict[str, int]]:
 # --------------------------------------------------------------------------
 
 
+def run_command(command: str) -> tuple[str, str]:
+    """Выполнить команду панели. Возвращает (статус, текст результата)."""
+    name = (command or "").strip()
+    try:
+        if name == "restart_xray":
+            if DRY_RUN:
+                return "done", "dry-run: перезапуск пропущен"
+            xray.restart()
+            return "done", "Xray перезапущен"
+        if name == "test_config":
+            ok, message = xray.test_config(CONFIG_PATH)
+            missing = "" if ok else ", ".join(missing_certificate_paths(CONFIG_PATH))
+            if missing:
+                return "error", f"нет файлов сертификата: {missing}"[:300]
+            return ("done" if ok else "error"), (message or "конфиг корректен")[:300]
+        if name == "restart_agent":
+            log("перезапуск агента по команде панели")
+            if shutil.which("systemctl"):
+                subprocess.run(["systemctl", "restart", "dfxray-node"], check=False, timeout=30)
+                return "done", "агент перезапущен через systemctl"
+            return "done", "агент завершает работу — systemd поднимет его снова"
+        return "error", f"неизвестная команда {name}"
+    except Exception as exc:  # команда не должна ронять агент
+        return "error", f"{exc!r}"[:300]
+
+
+def send_command_result(command_id: int, status: str, result: str) -> None:
+    try:
+        _request(
+            "POST",
+            f"{PANEL_URL}/api/agent/command",
+            {"id": command_id, "status": status, "result": result},
+        )
+    except Exception as exc:
+        log(f"не удалось отправить результат команды {command_id}: {exc}", "warn")
+
+
+def align_port(config: dict) -> dict:
+    """Привести порт inbound'ов к опубликованному (XRAY_PORT), если он задан."""
+    if not FORCED_PORT:
+        return config
+    inbounds = config.get("inbounds")
+    if not isinstance(inbounds, list):
+        return config
+    for inbound in inbounds:
+        if not isinstance(inbound, dict):
+            continue
+        tag = str(inbound.get("tag") or "")
+        if tag == "api":
+            continue
+        if int(inbound.get("port") or 0) != FORCED_PORT:
+            log(f"порт inbound «{tag}» {inbound.get('port')} → {FORCED_PORT} (XRAY_PORT)", "warn")
+            inbound["port"] = FORCED_PORT
+    return config
+
+
+def missing_certificates(config: dict) -> list[str]:
+    """Файлы сертификатов, которых нет на диске (частая причина «порт закрыт»)."""
+    missing: list[str] = []
+    for inbound in config.get("inbounds") or []:
+        stream = (inbound or {}).get("streamSettings") or {}
+        if stream.get("security") != "tls":
+            continue
+        for cert in (stream.get("tlsSettings") or {}).get("certificates") or []:
+            for key in ("certificateFile", "keyFile"):
+                path = str((cert or {}).get(key) or "")
+                if path and not os.path.isfile(path):
+                    missing.append(path)
+    return missing
+
+
+def missing_certificate_paths(config_path: str) -> list[str]:
+    """То же самое, но по конфигу на диске — для команды test_config."""
+    try:
+        with open(config_path, encoding="utf-8") as handle:
+            return missing_certificates(json.load(handle))
+    except (OSError, ValueError):
+        return []
+
+
 def apply_config(config: dict) -> bool:
+    global LAST_ERROR, APPLIED_PORT
     if not write_config(config, CONFIG_PATH):
+        LAST_ERROR = f"не удалось записать {CONFIG_PATH}"
+        return False
+    missing = missing_certificates(config)
+    if missing:
+        LAST_ERROR = (
+            "нет файлов сертификата: " + ", ".join(sorted(set(missing)))
+            + " — выпустите сертификат (certbot) или переключите ноду на Reality"
+        )[:400]
+        log(LAST_ERROR, "error")
         return False
     ok, message = xray.test_config(CONFIG_PATH)
     if not ok:
         log(f"xray -test отклонил конфиг: {message}", "error")
+        LAST_ERROR = f"xray -test: {message}"[:400]
         return False
     log("конфиг проверен и обновлён")
     xray.restart()
+    LAST_ERROR = ""
+    inbounds = config.get("inbounds") or []
+    APPLIED_PORT = int(inbounds[0].get("port") or 0) if inbounds else 0
     return True
 
 
 def loop() -> int:
+    global APPLIED_REVISION
     if not PANEL_URL:
         log("DFX_PANEL_URL не задан", "error")
         return 2
@@ -311,9 +485,19 @@ def loop() -> int:
                 f"клиентов {users_count}",
                 "debug",
             )
+            for command in payload.get("commands") or []:
+                if not isinstance(command, dict) or not command.get("id"):
+                    continue
+                log(f"команда панели: {command.get('command')}")
+                status, result = run_command(str(command.get("command") or ""))
+                send_command_result(int(command["id"]), status, result)
+                if command.get("command") == "restart_agent" and not shutil.which("systemctl"):
+                    return 0
+
             if new_revision != revision or not os.path.isfile(CONFIG_PATH):
-                if apply_config(payload.get("config") or {}):
+                if apply_config(align_port(payload.get("config") or {})):
                     revision = new_revision
+                    APPLIED_REVISION = new_revision
                 else:
                     log("конфиг не применён, остаётся предыдущий", "error")
             xray.ensure_running()
@@ -330,6 +514,7 @@ def loop() -> int:
                             "users": stats,
                             "node": {"up": total_up, "down": total_down},
                         },
+                        **system_metrics(),
                     }
                 )
                 if response.get("blocked"):
@@ -342,7 +527,13 @@ def loop() -> int:
                     "debug",
                 )
             else:
-                heartbeat({"xray_version": xray.detect_version(), "uptime": int(time.time() - started_at)})
+                heartbeat(
+                    {
+                        "xray_version": xray.detect_version(),
+                        "uptime": int(time.time() - started_at),
+                        **system_metrics(),
+                    }
+                )
         except urllib.error.HTTPError as exc:
             fail_count += 1
             body = ""

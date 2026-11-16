@@ -50,6 +50,13 @@ def user(**overrides):
     return base
 
 
+def node_inbound(config_data):
+    for inbound in config_data["inbounds"]:
+        if str(inbound.get("tag", "")).startswith("node-"):
+            return inbound
+    raise AssertionError("в конфиге нет inbound ноды")
+
+
 class PasswordTests(unittest.TestCase):
     def test_hash_and_verify(self):
         stored = auth.hash_password("correct horse battery staple")
@@ -140,11 +147,11 @@ class ConfigTests(unittest.TestCase):
     def test_clients_only_active(self):
         users = [user(id=1, username="a"), user(id=2, username="b")]
         config_data = xray.build_config(node(), users, {})
-        inbound = config_data["inbounds"][1]
+        inbound = node_inbound(config_data)
         emails = [client["email"] for client in inbound["settings"]["clients"]]
         self.assertEqual(emails, ["a", "b"])
         self.assertEqual(inbound["settings"]["decryption"], "none")
-        self.assertEqual(config_data["inbounds"][0]["port"], xray.API_PORT)
+        self.assertEqual(config_data["api"]["listen"], f"127.0.0.1:{xray.API_PORT}")
 
     def test_routing_rules_toggle(self):
         config_data = xray.build_config(node(), [], {"block_bittorrent": "0", "block_private": "0"})
@@ -162,26 +169,339 @@ class ConfigTests(unittest.TestCase):
 
     def test_no_flow_for_ws(self):
         config_data = xray.build_config(node(transport="ws", security="tls"), [user(flow="xtls-rprx-vision")], {})
-        client = config_data["inbounds"][1]["settings"]["clients"][0]
+        client = node_inbound(config_data)["settings"]["clients"][0]
         self.assertNotIn("flow", client)
 
     def test_reality_requires_keys(self):
         config_data = xray.build_config(node(), [])
-        reality = config_data["inbounds"][1]["streamSettings"]["realitySettings"]
+        reality = node_inbound(config_data)["streamSettings"]["realitySettings"]
         self.assertEqual(reality["privateKey"], "PRIVATE_KEY")
         self.assertEqual(reality["shortIds"], ["abcd1234"])
-        self.assertEqual(reality["dest"], "www.microsoft.com:443")
+        self.assertEqual(reality["target"], "www.microsoft.com:443")
 
     def test_tls_certificates(self):
         config_data = xray.build_config(node(security="tls"), [])
-        tls = config_data["inbounds"][1]["streamSettings"]["tlsSettings"]
+        tls = node_inbound(config_data)["streamSettings"]["tlsSettings"]
         self.assertEqual(tls["certificates"][0]["certificateFile"], "/etc/xray/cert/fullchain.pem")
         self.assertEqual(tls["alpn"], ["h2", "http/1.1"])
 
-    def test_device_limit(self):
+    def test_device_limit_is_not_sent_to_xray(self):
+        """limitIp — поле XrayR, а не Xray: в конфиг оно попадать не должно."""
         config_data = xray.build_config(node(), [user(device_limit=3)], {})
-        self.assertEqual(config_data["inbounds"][1]["settings"]["clients"][0]["limitIp"], 3)
+        client = node_inbound(config_data)["settings"]["clients"][0]
+        self.assertNotIn("limitIp", client)
+        self.assertEqual(client["email"], "alex")
+
+    def test_flow_only_vision_and_only_for_tcp(self):
+        vision = xray.client_entry(node(), user(flow="xtls-rprx-vision"))
+        self.assertEqual(vision["flow"], "xtls-rprx-vision")
+        self.assertNotIn("flow", xray.client_entry(node(), user(flow="xtls-rprx-direct")))
+        self.assertNotIn("flow", xray.client_entry(node(transport="ws"), user(flow="xtls-rprx-vision")))
 
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class RealityTests(unittest.TestCase):
+    """Сканер целей REALITY: разбор целей и оценка пригодности."""
+
+    def test_parse_targets_handles_lists_and_cidr(self):
+        from app import reality
+
+        targets = reality.parse_targets("a.example.com, 10.0.0.0/30\nb.example.com:8443")
+        hosts = [item.host for item in targets]
+        self.assertIn("a.example.com", hosts)
+        self.assertIn("b.example.com", hosts)
+        self.assertEqual(targets[-1].port, 8443)
+        self.assertIn("10.0.0.1", hosts)
+
+    def test_parse_targets_defaults(self):
+        from app import reality
+
+        targets = reality.parse_targets("")
+        self.assertEqual(len(targets), len(reality.DEFAULT_TARGETS))
+        self.assertTrue(all(item.port == 443 for item in targets))
+
+    def test_parse_targets_limits_ip_range(self):
+        from app import reality
+
+        targets = reality.parse_targets("10.0.0.1-10.0.0.250", limit=10)
+        self.assertEqual(len(targets), 10)
+
+    def test_certificate_matches_wildcard(self):
+        from app import reality
+
+        cert = {"san": ["*.example.com"], "subject": "example.com"}
+        self.assertTrue(reality.certificate_matches("cdn.example.com", cert))
+        self.assertTrue(reality.certificate_matches("example.com", cert))
+        self.assertFalse(reality.certificate_matches("other.org", cert))
+
+    def test_probe_classification(self):
+        from app import reality
+
+        probe = reality.Probe(target="x:443", host="x", port=443, tls="TLSv1.3", alpn="h2")
+        self.assertEqual(probe.to_dict()["status"], "fail")
+        ok = reality.Probe(
+            target="x:443", host="x", port=443, tls="TLSv1.3", alpn="h2",
+            latency_ms=40, cert="x", chain="x",
+        )
+        self.assertEqual(ok.status, "fail")  # status выставляется только пробой
+
+    def test_scan_manager_job(self):
+        from app import reality
+
+        original = reality.probe_target
+
+        def fake_probe(host, port=443, timeout=5.0, **kwargs):
+            return reality.Probe(
+                target=f"{host}:{port}", host=host, port=port,
+                status="ok", tls="TLSv1.3", alpn="h2", latency_ms=12,
+            )
+
+        reality.probe_target = fake_probe
+        try:
+            job = reality.MANAGER.start("one.example.com, two.example.com", timeout=1, workers=2)
+            job.thread.join(timeout=10)
+            snapshot = job.snapshot()
+        finally:
+            reality.probe_target = original
+        self.assertEqual(snapshot["status"], "done")
+        self.assertEqual(snapshot["done"], 2)
+        self.assertTrue(all(item["status"] == "ok" for item in snapshot["results"]))
+
+
+class OutboundConfigTests(unittest.TestCase):
+    """Исходящие из панели попадают в конфиг Xray."""
+
+    def test_outbound_configs(self):
+        rows = [
+            {"tag": "direct", "type": "direct", "enabled": 1},
+            {"tag": "socks-de", "type": "socks", "address": "10.0.0.2", "port": 1080,
+             "username": "u", "password": "p", "enabled": 1},
+            {"tag": "off", "type": "http", "address": "x", "port": 1, "enabled": 0},
+        ]
+        entries = xray.outbound_configs(rows)
+        tags = [item["tag"] for item in entries]
+        self.assertEqual(tags, ["direct", "socks-de"])
+        socks = entries[1]["settings"]["servers"][0]
+        self.assertEqual(socks["address"], "10.0.0.2")
+        self.assertEqual(socks["users"][0]["pass"], "p")
+
+    def test_build_config_merges_outbounds(self):
+        config = xray.build_config(
+            node(security="none", sni="", dest=""),
+            [],
+            {},
+            [{"tag": "socks-de", "type": "socks", "address": "10.0.0.2", "port": 1080,
+              "enabled": 1}],
+        )
+        tags = [item["tag"] for item in config["outbounds"]]
+        self.assertEqual(tags, ["direct", "block", "socks-de"])
+
+    def test_default_outbound_moves_first(self):
+        config = xray.build_config(
+            node(security="none", sni="", dest=""),
+            [],
+            {"route_default_outbound": "socks-de"},
+            [{"tag": "socks-de", "type": "socks", "address": "10.0.0.2", "port": 1080,
+              "enabled": 1}],
+        )
+        self.assertEqual(config["outbounds"][0]["tag"], "socks-de")
+
+
+class UpdateVersionTests(unittest.TestCase):
+    def test_is_newer(self):
+        from app import updates
+
+        self.assertTrue(updates.is_newer("1.1.0", "1.0.0"))
+        self.assertTrue(updates.is_newer("v1.0.1", "1.0.0"))
+        self.assertFalse(updates.is_newer("1.0.0", "1.0.0"))
+        self.assertFalse(updates.is_newer("0.9.9", "1.0.0"))
+
+    def test_version_tuple(self):
+        from app import updates
+
+        self.assertEqual(updates._version_tuple("v1.2.3"), (1, 2, 3))
+        self.assertEqual(updates._version_tuple("main"), ())
+
+
+class SelfUpdateTests(unittest.TestCase):
+    """Самообновление кода панели из GitHub-архива."""
+
+    def test_self_update_replaces_code_only(self):
+        import os
+        import pathlib
+        import shutil
+        import tarfile
+        import tempfile
+
+        from app import updates
+
+        with tempfile.TemporaryDirectory() as tmp:
+            src = pathlib.Path(tmp, "repo-main")
+            (src / "app").mkdir(parents=True)
+            (src / "app" / "config.py").write_text("VERSION = '9.9.9'\n", encoding="utf-8")
+            (src / "static").mkdir()
+            (src / "static" / "df.css").write_text("body{}\n", encoding="utf-8")
+            (src / ".env").write_text("DFX_ADMIN_PASSWORD=keep-me\n", encoding="utf-8")
+            (src / "secrets.txt").write_text("nope\n", encoding="utf-8")
+            archive = pathlib.Path(tmp, "src.tar.gz")
+            with tarfile.open(archive, "w:gz") as tar:
+                tar.add(src, arcname="repo-main")
+
+            target = pathlib.Path(tmp, "target")
+            (target / "app").mkdir(parents=True)
+            (target / ".env").write_text("DFX_ADMIN_PASSWORD=stay\n", encoding="utf-8")
+
+            original = updates._download
+            updates._download = lambda url, dest, timeout=0: shutil.copyfile(archive, dest)
+            try:
+                result = updates.self_update(ref="main", target=str(target))
+            finally:
+                updates._download = original
+
+            self.assertTrue(result["ok"], result)
+            self.assertEqual((target / "app" / "config.py").read_text(encoding="utf-8"), "VERSION = '9.9.9'\n")
+            self.assertTrue((target / "static" / "df.css").exists())
+            self.assertEqual((target / ".env").read_text(encoding="utf-8"), "DFX_ADMIN_PASSWORD=stay\n")
+            self.assertFalse((target / "secrets.txt").exists())
+            self.assertEqual(os.path.basename(result["target"]), "target")
+
+    def test_self_capability(self):
+        import os
+        import pathlib
+        import tempfile
+
+        from app import updates
+
+        with tempfile.TemporaryDirectory() as tmp:
+            (pathlib.Path(tmp) / "app").mkdir()
+            os.environ["DFX_SELF_DIR"] = tmp
+            updates.SELF_TARGET = tmp
+            previous_target = updates.self_target
+            try:
+                os.environ.pop("DFX_SELF_UPDATE", None)
+                # без маркера обновляем собственный каталог кода (pip/systemd)
+                self.assertTrue(updates.self_capable())
+                self.assertEqual(updates.self_target(), updates.code_dir())
+                os.environ["DFX_SELF_UPDATE"] = "1"
+                updates.self_target = lambda: pathlib.Path(tmp)
+                self.assertTrue(updates.self_capable())
+                cap = updates.capability()
+                self.assertEqual(cap["mode"], "self")
+                self.assertIn("self-update", cap["command"])
+                self.assertIn(tmp, cap["command"])
+            finally:
+                updates.self_target = previous_target
+                os.environ.pop("DFX_SELF_UPDATE", None)
+
+    def test_manual_capability_explains_reason(self):
+        import os
+        import tempfile
+
+        from app import updates
+
+        with tempfile.TemporaryDirectory() as tmp:
+            previous = (updates.self_target, updates.install_dir, updates.in_container)
+            updates.self_target = lambda: __import__("pathlib").Path(tmp) / "missing"
+            updates.install_dir = lambda: __import__("pathlib").Path(tmp)
+            updates.in_container = lambda: True
+            try:
+                cap = updates.capability()
+                self.assertEqual(cap["mode"], "manual")
+                self.assertIn("контейнер", cap["hint"])
+                self.assertTrue(cap["instructions"])
+            finally:
+                updates.self_target, updates.install_dir, updates.in_container = previous
+                os.environ.pop("DFX_SELF_UPDATE", None)
+
+
+class X25519Tests(unittest.TestCase):
+    """Ключи Reality считаются на чистом Python — openssl и xray не нужны."""
+
+    def test_rfc7748_vectors(self):
+        from app import x25519
+
+        alice_priv = bytes.fromhex("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a")
+        alice_pub = bytes.fromhex("8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a")
+        bob_priv = bytes.fromhex("5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb")
+        bob_pub = bytes.fromhex("de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f")
+        shared = bytes.fromhex("4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742")
+        self.assertEqual(x25519.public_key(alice_priv), alice_pub)
+        self.assertEqual(x25519.public_key(bob_priv), bob_pub)
+        self.assertEqual(x25519.x25519(alice_priv, bob_pub), shared)
+
+    def test_generate_matches_xray_format(self):
+        from app import x25519
+
+        private_key, public_key = x25519.generate()
+        self.assertEqual(len(private_key), 43)
+        self.assertEqual(len(public_key), 43)
+        self.assertNotIn("=", private_key)
+        self.assertEqual(
+            x25519.b64url(x25519.public_key(x25519.b64url_decode(private_key))), public_key
+        )
+
+    def test_panel_keypair_has_no_external_dependencies(self):
+        from app import xray
+
+        private_key, public_key = xray.generate_reality_keypair()
+        self.assertEqual(len(private_key), 43)
+        self.assertEqual(len(public_key), 43)
+        short_id = xray.generate_short_id(8)
+        self.assertEqual(len(short_id), 8)
+        self.assertTrue(all(ch in "0123456789abcdef" for ch in short_id))
+
+
+class MigrationTests(unittest.TestCase):
+    """Миграция старой базы до схемы с метриками серверов."""
+
+    def test_v3_migration_adds_node_columns(self):
+        import sqlite3
+
+        from app import db
+
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.executescript(
+            """
+            CREATE TABLE users (id INTEGER PRIMARY KEY);
+            CREATE TABLE groups (id INTEGER PRIMARY KEY);
+            CREATE TABLE admins (id INTEGER PRIMARY KEY, username TEXT);
+            CREATE TABLE nodes (id INTEGER PRIMARY KEY, name TEXT);
+            CREATE TABLE traffic (user_id INTEGER, node_id INTEGER, day TEXT, up INTEGER, down INTEGER);
+            INSERT INTO nodes (name) VALUES ('old node');
+            """
+        )
+        db._migrate(conn)
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(nodes)")}
+        for expected in ("region", "install_token", "agent_version", "xray_running",
+                         "uptime_seconds", "load1", "cfg_revision", "last_error", "drain"):
+            self.assertIn(expected, columns)
+        admin_columns = {row["name"] for row in conn.execute("PRAGMA table_info(admins)")}
+        self.assertIn("totp_secret", admin_columns)
+        token = conn.execute("SELECT install_token FROM nodes").fetchone()[0]
+        self.assertTrue(token)
+
+
+class LatencyTest(unittest.TestCase):
+    def test_sort_links_orders_by_latency(self):
+        from app import latency
+
+        latency.reset_cache()
+        links = [
+            {"node_id": 1, "node_name": "far"},
+            {"node_id": 2, "node_name": "near"},
+            {"node_id": 3, "node_name": "down"},
+        ]
+        result = latency.sort_links(links, {1: 120.0, 2: 15.5, 3: None})
+        self.assertEqual([item["node_name"] for item in result], ["near", "far", "down"])
+        self.assertEqual(result[0]["latency_ms"], 15.5)
+        self.assertIsNone(result[2]["latency_ms"])
+
+    def test_measure_caches_results(self):
+        from app import latency
+
+        latency.reset_cache()
+        self.assertEqual(latency.measure([]), {})

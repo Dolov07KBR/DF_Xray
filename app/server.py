@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import gzip
 import json
 import mimetypes
 import re
@@ -210,11 +211,27 @@ def dispatch(req: Request) -> Response:
         req.params = {k: v for k, v in match.groupdict().items()}
         if item.auth_required:
             admin = auth.resolve_session(req.cookies.get(config.SESSION_COOKIE))
+            bearer = False
+            if admin is None:
+                header = req.header("authorization", "")
+                if header.lower().startswith("bearer "):
+                    admin = auth.verify_api_token(header[7:].strip())
+                    bearer = admin is not None
+                    if (
+                        admin is not None
+                        and admin.get("scope") != "write"
+                        and req.method not in ("GET", "HEAD")
+                    ):
+                        raise ApiError(403, "Токен создан только для чтения")
             if admin is None:
                 raise ApiError(401, "Требуется авторизация")
             req.admin = admin
-            # Простейшая CSRF-защита: SPA всегда отправляет этот заголовок.
-            if req.method not in ("GET", "HEAD") and req.header("x-requested-with") != "DF_Xray":
+            # CSRF-заголовок нужен только cookie-сессиям; Bearer-токены от CSRF не страдают.
+            if (
+                not bearer
+                and req.method not in ("GET", "HEAD")
+                and req.header("x-requested-with") != "DF_Xray"
+            ):
                 raise ApiError(403, "Отсутствует заголовок X-Requested-With")
         return item.handler(req)
     if allowed:
@@ -245,7 +262,13 @@ MIME_TYPES = {
 }
 
 
-def serve_static(rel_path: str) -> Response:
+def _gzip(body: bytes, accept_encoding: str) -> bytes | None:
+    if "gzip" not in (accept_encoding or "").lower() or len(body) < 1400:
+        return None
+    return gzip.compress(body, 6)
+
+
+def serve_static(rel_path: str, accept_encoding: str = "", if_none_match: str = "") -> Response:
     rel_path = rel_path.lstrip("/")
     candidate = (config.STATIC_DIR / rel_path).resolve()
     static_root = config.STATIC_DIR.resolve()
@@ -258,8 +281,15 @@ def serve_static(rel_path: str) -> Response:
     body = candidate.read_bytes()
     headers = {
         "ETag": etag,
-        "Cache-Control": "public, max-age=300" if ext not in (".html",) else "no-cache",
+        "Cache-Control": "public, max-age=3600" if ext not in (".html",) else "no-cache",
     }
+    if if_none_match and if_none_match.strip() == etag:
+        return Response(b"", status=304, content_type=content_type, headers=headers)
+    packed = _gzip(body, accept_encoding)
+    if packed is not None and ext in (".js", ".css", ".svg", ".json", ".map", ".txt"):
+        headers["Content-Encoding"] = "gzip"
+        headers["Vary"] = "Accept-Encoding"
+        body = packed
     return Response(body, content_type=content_type, headers=headers)
 
 
@@ -307,6 +337,19 @@ class Handler(BaseHTTPRequestHandler):
 
     def _write(self, response: Response) -> None:
         body = response.body
+        content_type = (response.headers.get("Content-Type") or "").lower()
+        if (
+            "Content-Encoding" not in response.headers
+            and len(body) > 1400
+            and ("application/json" in content_type or "text/" in content_type)
+        ):
+            packed = _gzip(body, self.headers.get("Accept-Encoding", ""))
+            if packed is not None:
+                response.headers["Content-Encoding"] = "gzip"
+                response.headers["Vary"] = "Accept-Encoding"
+                body = packed
+        if "application/json" in content_type and "Cache-Control" not in response.headers:
+            response.headers["Cache-Control"] = "no-store"
         self.send_response(response.status)
         for key, value in response.headers.items():
             self.send_header(key, value)
@@ -375,6 +418,12 @@ def serve() -> None:
     db.init()
     import app.api
     import app.pages  # noqa: F401
+
+    from . import notify, sysinfo, tgbot
+
+    notify.start_worker()
+    sysinfo.start_sampler()
+    tgbot.start_worker()
 
     server = PanelHTTPServer((config.HOST, config.PORT), Handler)
     print(

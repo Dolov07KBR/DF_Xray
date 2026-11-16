@@ -42,7 +42,11 @@ if [ "${#_cfg[@]}" -gt 0 ] && [ -n "${_cfg[0]:-}" ]; then
 fi
 
 compose() {
-    "${COMPOSE_BIN[@]}" --project-directory "$DFX_HOME" -f "$DFX_HOME/docker-compose.yml" "$@"
+    local files=(-f "$DFX_HOME/docker-compose.yml")
+    if [ -f "$DFX_HOME/docker-compose.selfupdate.yml" ]; then
+        files+=(-f "$DFX_HOME/docker-compose.selfupdate.yml")
+    fi
+    "${COMPOSE_BIN[@]}" --project-directory "$DFX_HOME" "${files[@]}" "$@"
 }
 
 env_value() {
