@@ -396,6 +396,49 @@ class SelfUpdateTests(unittest.TestCase):
                 updates.self_target = previous_target
                 os.environ.pop("DFX_SELF_UPDATE", None)
 
+    def test_self_update_runs_in_process(self):
+        import pathlib
+        import tempfile
+        import time
+
+        from app import updates
+
+        with tempfile.TemporaryDirectory() as tmp:
+            previous = (updates.capability, updates.self_update, updates.supervised, updates.self_target)
+            updates.self_target = lambda: pathlib.Path(tmp)
+            updates.capability = lambda: {
+                "mode": "self", "label": "Самообновление",
+                "command": "python -m app self-update --target " + tmp,
+                "hint": tmp, "instructions": "",
+            }
+            calls = []
+
+            def fake_self_update(ref="main", target=None):
+                calls.append((ref, target))
+                return {"files": 3, "ref": ref}
+
+            updates.self_update = fake_self_update
+            updates.supervised = lambda: False
+            updates._STATE.update({"running": False, "ok": None, "log": ""})
+            try:
+                started = updates.start_update()
+                for _ in range(50):
+                    if not updates.status()["running"]:
+                        break
+                    time.sleep(0.05)
+                state = updates.status()
+            finally:
+                (
+                    updates.capability, updates.self_update,
+                    updates.supervised, updates.self_target,
+                ) = previous
+                updates._STATE.update({"running": False, "ok": None, "log": ""})
+        self.assertTrue(started["started"])
+        self.assertEqual(started["mode"], "self")
+        self.assertEqual(calls, [("main", pathlib.Path(tmp).as_posix())])
+        self.assertTrue(state["ok"])
+        self.assertIn("Файлов обновлено: 3", state["log"])
+
     def test_manual_capability_explains_reason(self):
         import os
         import tempfile
