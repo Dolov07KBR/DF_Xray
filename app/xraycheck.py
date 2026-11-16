@@ -29,23 +29,43 @@ INBOUND_KEYS = {"tag", "listen", "port", "protocol", "settings", "streamSettings
 STREAM_KEYS = {
     "network", "method", "security", "tcpSettings", "rawSettings", "wsSettings",
     "grpcSettings", "xhttpSettings", "httpupgradeSettings", "realitySettings",
-    "tlsSettings", "sockopt", "finalmask",
+    "tlsSettings", "sockopt", "finalmask", "kcpSettings", "hysteriaSettings",
+    "masqueSettings", "xdriveSettings",
 }
+# Наборы полей сверены с infra/conf Xray-core (transport_security.go,
+# transport_method.go, xray.go) — неизвестные поля Xray молча игнорирует,
+# поэтому лучше поймать опечатку в панели, чем искать её на ноде.
 TLS_KEYS = {
     "serverName", "alpn", "minVersion", "maxVersion", "certificates", "allowInsecure",
-    "rejectUnknownSni", "disableSystemRoot", "enableSessionResumption", "cipherSuites",
-    "fingerprint", "echConfigList", "pinnedPeerCertificateChainSha256",
+    "cipherSuites", "curvePreferences", "disableSystemRoot", "enableSessionResumption",
+    "fingerprint", "masterKeyLog", "echConfigList", "echServerKeys", "echSockopt",
+    "pinnedPeerCertSha256", "rejectUnknownSni", "useSystemCA", "verifyPeerCertByName",
 }
 REALITY_KEYS = {
-    "show", "target", "dest", "xver", "serverNames", "privateKey", "minClientVer",
-    "maxClientVer", "maxTimeDiff", "shortIds", "spiderX", "mldsa65Seed",
-    "limitFallbackUpload", "limitFallbackDownload",
+    "show", "target", "dest", "xver", "serverNames", "privateKey", "shortIds",
+    "spiderX", "mldsa65Seed", "mldsa65Verify", "publicKey", "password", "shortId",
+    "serverName", "fingerprint", "type", "masterKeyLog", "minClientVer", "maxClientVer",
+    "maxTimeDiff", "limitFallbackUpload", "limitFallbackDownload",
 }
-WS_KEYS = {"path", "host", "headers", "acceptProxyProtocol", "heartbeatPeriod", "compression"}
-GRPC_KEYS = {"serviceName", "multiMode", "authority", "user_agent"}
-XHTTP_KEYS = {"path", "host", "mode", "headers", "extra", "xmux", "downloadSettings",
-              "scMaxEachPostBytes", "noSSEHeader"}
+WS_KEYS = {"path", "host", "headers", "acceptProxyProtocol", "heartbeatPeriod"}
+GRPC_KEYS = {
+    "serviceName", "multiMode", "authority", "user_agent", "health_check_timeout",
+    "idle_timeout", "permit_without_stream", "initial_windows_size",
+}
+XHTTP_KEYS = {
+    "path", "host", "mode", "headers", "extra", "xmux", "downloadSettings", "h2Params",
+    "noGRPCHeader", "noSSEHeader", "uplinkHTTPMethod", "seqKey", "seqPlacement",
+    "sessionIDKey", "sessionIDLength", "sessionIDPlacement", "sessionIDTable",
+    "uplinkChunkSize", "uplinkDataKey", "uplinkDataPlacement", "scMaxEachPostBytes",
+    "scMinPostsIntervalMs", "scMaxBufferedPosts", "scStreamUpServerSecs",
+    "serverMaxHeaderBytes", "xPaddingBytes", "xPaddingObfsMode", "xPaddingKey",
+    "xPaddingHeader", "xPaddingPlacement", "xPaddingMethod",
+}
 HTTPUPGRADE_KEYS = {"path", "host", "headers", "acceptProxyProtocol"}
+CERT_KEYS = {
+    "certificateFile", "certificate", "keyFile", "key", "usage", "ocspStapling",
+    "oneTimeLoading", "buildChain",
+}
 SNIFFING_KEYS = {"enabled", "destOverride", "metadataOnly", "routeOnly", "domainsExcluded"}
 OUTBOUND_KEYS = {"tag", "protocol", "settings", "streamSettings", "sendThrough", "mux", "proxySettings"}
 API_KEYS = {"tag", "listen", "services", "listenAddr"}
@@ -148,6 +168,7 @@ def _check_stream(problems: list[str], path: str, stream: Any) -> None:
                 if not isinstance(cert, dict):
                     _err(problems, f"{path}.tlsSettings.certificates[{index}]", "ожидался объект")
                     continue
+                _unknown(problems, f"{path}.tlsSettings.certificates[{index}]", cert, CERT_KEYS)
                 if not str(cert.get("certificateFile") or cert.get("certificate") or "").strip():
                     _err(problems, f"{path}.tlsSettings.certificates[{index}]", "нет certificateFile")
                 if not str(cert.get("keyFile") or cert.get("key") or "").strip():
@@ -190,7 +211,22 @@ def _check_inbound(problems: list[str], index: int, inbound: Any) -> str:
             if client.get("flow"):
                 if protocol != "vless":
                     _err(problems, f"{path}.settings.clients[{client_index}]", "flow есть только у VLESS")
-                elif client["flow"] != VISION_FLOW:
+                else:
+                    network = str((inbound.get("streamSettings") or {}).get("network") or "tcp").lower()
+                    security = str((inbound.get("streamSettings") or {}).get("security") or "none").lower()
+                    if network not in {"tcp", "raw"}:
+                        _err(
+                            problems,
+                            f"{path}.settings.clients[{client_index}]",
+                            f"flow нельзя использовать с транспортом {network}",
+                        )
+                    elif security not in {"tls", "reality"}:
+                        _err(
+                            problems,
+                            f"{path}.settings.clients[{client_index}]",
+                            "flow работает только поверх TLS или REALITY",
+                        )
+                if client["flow"] != VISION_FLOW:
                     _err(
                         problems,
                         f"{path}.settings.clients[{client_index}]",

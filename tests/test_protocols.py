@@ -216,5 +216,33 @@ class LinksTests(unittest.TestCase):
         self.assertNotIn("flow", params)
 
 
+class SchemaGuardTests(unittest.TestCase):
+    """Проверки, которые ловят поля, отсутствующие в Xray (частая причина «не поднимается»)."""
+
+    def test_limit_ip_is_rejected_by_validator(self):
+        cfg = xray.build_config(make_node(), [USER])
+        cfg["inbounds"][0]["settings"]["clients"][0]["limitIp"] = 3
+        self.assertTrue(any("limitIp" in problem for problem in xraycheck.validate_config(cfg)))
+
+    def test_flow_with_ws_transport_is_rejected(self):
+        cfg = xray.build_config(make_node(transport="ws", security="tls", path="/ws"), [USER])
+        cfg["inbounds"][0]["settings"]["clients"][0]["flow"] = nodecfg.VISION_FLOW
+        self.assertTrue(
+            any("транспортом ws" in problem for problem in xraycheck.validate_config(cfg))
+        )
+
+    def test_unknown_certificate_field(self):
+        cfg = xray.build_config(make_node(security="tls"), [USER])
+        cfg["inbounds"][0]["streamSettings"]["tlsSettings"]["certificates"][0]["certPath"] = "/x"
+        self.assertTrue(
+            any("certPath" in problem for problem in xraycheck.validate_config(cfg))
+        )
+
+    def test_reality_server_has_no_client_fields(self):
+        reality = xray.build_config(make_node(), [USER])["inbounds"][0]["streamSettings"]["realitySettings"]
+        for field in ("spiderX", "publicKey", "shortId"):
+            self.assertNotIn(field, reality)
+
+
 if __name__ == "__main__":
     unittest.main()
